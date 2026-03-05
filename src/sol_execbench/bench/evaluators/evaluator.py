@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Optional
@@ -22,12 +23,53 @@ from ...data import (
     Workload,
 )
 from ...data.workload import CorrectnessSpec
+from .reward_hack import (
+    check_lazy_outputs,
+    check_thread_injection,
+)
+from .utils import allocate_outputs, normalize_result
 
 
 class Evaluator(ABC):
     @classmethod
     @abstractmethod
     def can_evaluate(cls, definition: Definition) -> bool: ...
+
+    @classmethod
+    def run_solution(
+        cls,
+        definition: Definition,
+        sol_runnable: Runnable,
+        inp: RunnableInputs,
+        device: str,
+    ) -> list[torch.Tensor]:
+        """Run the solution function with reward-hack checks.
+
+        Handles both DPS and value-returning calling conventions,
+        and checks for thread injection and lazy outputs.
+
+        Raises:
+            RewardHackDetected: If a reward hack is detected.
+            Exception: If the solution function fails.
+        """
+        is_dps = sol_runnable.metadata.destination_passing_style
+        threads_before = threading.active_count()
+
+        if is_dps:
+            out = allocate_outputs(definition, inp.resolved_axes, device)
+            with torch.no_grad():
+                sol_runnable(*inp, *out)
+            torch.cuda.synchronize(device)
+        else:
+            with torch.no_grad():
+                result = sol_runnable(*inp)
+            torch.cuda.synchronize(device)
+            out = normalize_result(definition, result, device)
+
+        check_thread_injection(threads_before, threading.active_count())
+        check_lazy_outputs(out)
+
+        return out
 
     @classmethod
     @abstractmethod

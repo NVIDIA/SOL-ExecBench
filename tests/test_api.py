@@ -231,5 +231,63 @@ class TestCuTileSolutions:
         _run_e2e("jamba_attn_proj", "solution_cutile.json")
 
 
+# ---------------------------------------------------------------------------
+# Reward hack detection tests
+# ---------------------------------------------------------------------------
+
+
+def _run_reward_hack_e2e(solution_file: str):
+    """Load an rmsnorm reward-hack solution and assert it is caught."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    sample_dir = SAMPLES_DIR / "rmsnorm"
+    definition = load_json_file(Definition, sample_dir / "definition.json")
+    workloads = load_jsonl_file(Workload, sample_dir / "workload.jsonl")
+    solution = load_json_file(Solution, sample_dir / solution_file)
+
+    benchmark = Benchmark(
+        hardware=SupportedHardware.LOCAL,
+        config=BenchmarkConfig(lock_clocks=False),
+    )
+
+    results = benchmark.run_workload(
+        definition=definition,
+        workload=workloads[0],
+        solutions=[solution],
+        trace_set_root=Path(__file__).parent.parent.parent.absolute(),
+    )
+
+    evaluation = results[solution.name]
+    assert evaluation.status == EvaluationStatus.RUNTIME_ERROR, (
+        f"Expected RUNTIME_ERROR for {solution_file}, got {evaluation.status}"
+    )
+    return evaluation
+
+
+class TestRewardHackDetection:
+    """Tests that reward-hacking solutions are caught and return RUNTIME_ERROR."""
+
+    def test_thread_injection(self):
+        """Spawning a background thread during execution should be detected."""
+        _run_reward_hack_e2e("solution_hack_thread_injection.json")
+
+    def test_lazy_output(self):
+        """Returning a torch.Tensor subclass should be detected."""
+        _run_reward_hack_e2e("solution_hack_lazy_output.json")
+
+    def test_monkey_patch(self):
+        """Patching torch.cuda.Event.elapsed_time should be detected."""
+        original = torch.cuda.Event.elapsed_time
+        try:
+            _run_reward_hack_e2e("solution_hack_monkey_patch.json")
+        finally:
+            torch.cuda.Event.elapsed_time = original
+
+    def test_stream_injection(self):
+        """Hiding work on a side CUDA stream should be detected."""
+        _run_reward_hack_e2e("solution_hack_stream_injection.json")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

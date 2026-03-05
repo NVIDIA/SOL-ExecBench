@@ -21,7 +21,7 @@ from ...data import (
 from ...data.workload import CorrectnessSpec
 
 from .default import DefaultEvaluator
-from .utils import allocate_outputs, normalize_result
+from .reward_hack import RewardHackDetected
 
 
 class LowBitEvaluator(DefaultEvaluator):
@@ -48,20 +48,17 @@ class LowBitEvaluator(DefaultEvaluator):
         max_rel = 0.0
         numerical_incorrect = False
         min_matched_ratio = 1.0
-        is_dps = sol_runnable.metadata.destination_passing_style
 
         for trial, inp in enumerate(inputs):
             try:
-                if is_dps:
-                    out = allocate_outputs(definition, inp.resolved_axes, device)
-                    with torch.no_grad():
-                        sol_runnable(*inp, *out)
-                    torch.cuda.synchronize(device)
-                else:
-                    with torch.no_grad():
-                        result = sol_runnable(*inp)
-                    torch.cuda.synchronize(device)
-                    out = normalize_result(definition, result, device)
+                out = cls.run_solution(definition, sol_runnable, inp, device)
+            except RewardHackDetected as e:
+                print(f"Reward hack detected: {e}")
+                return None, make_eval(
+                    status=EvaluationStatus.RUNTIME_ERROR,
+                    hardware=hardware,
+                    log_path=log_path,
+                )
             except Exception:
                 traceback.print_exc()
                 return None, make_eval(

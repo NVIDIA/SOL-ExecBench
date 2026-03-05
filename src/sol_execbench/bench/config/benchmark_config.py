@@ -28,6 +28,7 @@ class BenchmarkConfig:
     timeout_seconds: int = field(default=300)
     time_baseline: bool = field(default=True)
     lock_clocks: bool = field(default=True)
+    stream_injection_multiplier: float = field(default=3.0)
 
     allow_failed_baseline: bool = field(default=False)
 

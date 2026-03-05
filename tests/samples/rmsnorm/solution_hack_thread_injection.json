@@ -1,0 +1,18 @@
+{
+  "name": "rmsnorm_hack_thread_injection",
+  "definition": "rmsnorm_h4096",
+  "author": "test",
+  "spec": {
+    "language": "python",
+    "target_hardware": ["LOCAL"],
+    "entry_point": "kernel.py::run",
+    "dependencies": ["torch"],
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "kernel.py",
+      "content": "import threading\nimport time\nimport torch\n\ndef _background_work():\n    time.sleep(10)\n\n@torch.no_grad()\ndef run(hidden_states, weight):\n    t = threading.Thread(target=_background_work, daemon=True)\n    t.start()\n    batch_size, hidden_size = hidden_states.shape\n    EPS = 1e-5\n    x = hidden_states.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    y = (x * inv_rms) * weight.to(torch.float32)\n    return y.to(hidden_states.dtype)\n"
+    }
+  ]
+}

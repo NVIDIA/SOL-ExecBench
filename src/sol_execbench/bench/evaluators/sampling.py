@@ -31,6 +31,7 @@ from ...data import (
 from ...data.workload import CorrectnessSpec
 
 from .default import DefaultEvaluator
+from .reward_hack import RewardHackDetected
 from .utils import allocate_outputs, normalize_result
 
 
@@ -151,7 +152,6 @@ class SamplingEvaluator(DefaultEvaluator):
         inp = inputs[0]
         probs = _get_input_by_name(definition, inp, "probs")
         params = _get_inputs_by_names(definition, inp, ["top_k", "top_p"])
-        is_dps = sol_runnable.metadata.destination_passing_style
 
         # Compute valid sampling mask based on thresholding
         thresholding_method = _detect_thresholding_method(definition)
@@ -160,16 +160,14 @@ class SamplingEvaluator(DefaultEvaluator):
         # Validate correct sampling token set
         for _ in range(correctness.sampling_validation_trials):
             try:
-                if is_dps:
-                    out = allocate_outputs(definition, inp.resolved_axes, device)
-                    with torch.no_grad():
-                        sol_runnable(*inp, *out)
-                    torch.cuda.synchronize(device)
-                else:
-                    with torch.no_grad():
-                        result = sol_runnable(*inp)
-                    torch.cuda.synchronize(device)
-                    out = normalize_result(definition, result, device)
+                out = cls.run_solution(definition, sol_runnable, inp, device)
+            except RewardHackDetected as e:
+                print(f"Reward hack detected: {e}")
+                return None, make_eval(
+                    status=EvaluationStatus.RUNTIME_ERROR,
+                    hardware=hardware,
+                    log_path=log_path,
+                )
             except Exception:
                 traceback.print_exc()
                 return None, make_eval(

@@ -12,6 +12,11 @@ from ..config import BenchmarkConfig
 from .evaluator import Evaluator
 from ..runner.runner import BaselineHandle, DeviceBaseline
 from ..timing import time_runnable
+from .reward_hack import (
+    RewardHackDetected,
+    check_monkey_patch,
+    check_stream_injection,
+)
 from ..utils import (
     compute_error_stats,
     gen_inputs,
@@ -124,22 +129,17 @@ class DefaultEvaluator(Evaluator):
         max_abs = 0.0
         max_rel = 0.0
         numerical_incorrect = False
-        is_dps = sol_runnable.metadata.destination_passing_style
 
         for trial, inp in enumerate(inputs):
             try:
-                if is_dps:
-                    # DPS style: allocate outputs and call with them
-                    out = allocate_outputs(definition, inp.resolved_axes, device)
-                    with torch.no_grad():
-                        sol_runnable(*inp, *out)
-                    torch.cuda.synchronize(device)
-                else:
-                    # Value-returning style: call and normalize result
-                    with torch.no_grad():
-                        result = sol_runnable(*inp)
-                    torch.cuda.synchronize(device)
-                    out = normalize_result(definition, result, device)
+                out = cls.run_solution(definition, sol_runnable, inp, device)
+            except RewardHackDetected as e:
+                print(f"Reward hack detected: {e}")
+                return None, make_eval(
+                    status=EvaluationStatus.RUNTIME_ERROR,
+                    hardware=hardware,
+                    log_path=log_path,
+                )
             except Exception:
                 traceback.print_exc()
                 return None, make_eval(
@@ -230,6 +230,17 @@ class DefaultEvaluator(Evaluator):
         is_dps = sol_runnable.metadata.destination_passing_style
 
         try:
+            check_monkey_patch()
+        except RewardHackDetected as e:
+            print(f"Reward hack detected: {e}")
+            return None, make_eval(
+                status=EvaluationStatus.RUNTIME_ERROR,
+                hardware=hardware,
+                log_path=log_path,
+            )
+
+        try:
+            last_args = None
             for inp in inputs:
                 if is_dps:
                     # DPS style: allocate outputs and include in args
@@ -250,6 +261,7 @@ class DefaultEvaluator(Evaluator):
                     lock_clocks=cfg.lock_clocks,
                 )
                 sol_latencies.append(ms)
+                last_args = args
         except Exception:
             traceback.print_exc()
             return None, make_eval(
@@ -257,6 +269,23 @@ class DefaultEvaluator(Evaluator):
                 hardware=hardware,
                 log_path=log_path,
             )
+
+        if last_args is not None and sol_latencies:
+            try:
+                check_stream_injection(
+                    sol_runnable,
+                    last_args,
+                    sol_latencies[-1],
+                    cfg.stream_injection_multiplier,
+                    device,
+                )
+            except RewardHackDetected as e:
+                print(f"Reward hack detected: {e}")
+                return None, make_eval(
+                    status=EvaluationStatus.RUNTIME_ERROR,
+                    hardware=hardware,
+                    log_path=log_path,
+                )
 
         if not sol_latencies:
             print("Failed to collect solution latencies", file=sys.stderr)
