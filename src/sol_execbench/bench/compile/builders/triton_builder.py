@@ -24,7 +24,7 @@ class TritonBuilder(PythonBuilder):
     """Prefix for cache keys to distinguish Triton solutions from pure Python ones."""
 
     _BUILD_DIR_NAME: ClassVar[str] = "triton"
-    """Subdirectory under SOLBENCH_CACHE_PATH where build results are stored"""
+    """Subdirectory under SOLEXECBENCH_CACHE_PATH where build results are stored"""
 
     def __init__(self) -> None:
         Builder.__init__(self, self._PACKAGE_PREFIX, self._BUILD_DIR_NAME)

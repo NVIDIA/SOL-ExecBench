@@ -89,7 +89,7 @@ def main() -> int:
 
     config = BenchmarkConfig(
         lock_clocks=False,
-        profile_baseline=False,
+        time_baseline=False,
         num_trials=1,
         allow_failed_baseline=True,
     )

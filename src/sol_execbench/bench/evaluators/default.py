@@ -28,6 +28,7 @@ from ...data import (
     SupportedHardware,
     Workload,
 )
+from ...data.workload import CorrectnessSpec
 from .utils import allocate_outputs, normalize_result
 
 
@@ -77,7 +78,7 @@ class DefaultEvaluator(Evaluator):
                 traceback.print_exc()
                 raise RuntimeError(f"Reference code execution failed: {e}")
 
-        if cfg.profile_baseline:
+        if cfg.time_baseline:
             latencies: list[float] = []
             for inp in inputs:
                 ms = time_runnable(
@@ -104,6 +105,7 @@ class DefaultEvaluator(Evaluator):
             inputs=inputs,
             outputs=outputs,
             mean_latency_ms=mean_latency_ms,
+            correctness=workload.correctness,
         )
 
     @classmethod
@@ -114,6 +116,7 @@ class DefaultEvaluator(Evaluator):
         inputs: list[RunnableInputs],
         ref_outputs: list[list[torch.Tensor]],
         cfg: BenchmarkConfig,
+        correctness: CorrectnessSpec,
         log_path: str,
         device: str,
         hardware: SupportedHardware = SupportedHardware.LOCAL,
@@ -187,7 +190,7 @@ class DefaultEvaluator(Evaluator):
 
                 # Compute error statistics
                 abs_err, rel_err, exceeds_tol, _ = compute_error_stats(
-                    sol_tensor, ref_tensor, cfg
+                    sol_tensor, ref_tensor, correctness
                 )
 
                 if exceeds_tol:

@@ -29,7 +29,7 @@ class TorchBuilder(Builder):
     """A unique prefix to prepend to the package name."""
 
     _BUILD_DIR_NAME: ClassVar[str] = "torch"
-    """A unique subdirectory under SOLBENCH_CACHE_PATH where build results are stored."""
+    """A unique subdirectory under SOLEXECBENCH_CACHE_PATH where build results are stored."""
 
     _CPP_CUDA_EXTENSIONS: ClassVar[list[str]] = [".cu", ".cpp", ".cc", ".cxx", ".c"]
     """C/C++ and CUDA source file extensions."""

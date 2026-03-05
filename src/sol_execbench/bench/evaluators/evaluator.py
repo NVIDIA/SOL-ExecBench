@@ -21,6 +21,7 @@ from ...data import (
     SupportedHardware,
     Workload,
 )
+from ...data.workload import CorrectnessSpec
 
 
 class Evaluator(ABC):
@@ -50,6 +51,7 @@ class Evaluator(ABC):
         inputs: list[RunnableInputs],
         ref_outputs: list[list[torch.Tensor]],
         cfg: BenchmarkConfig,
+        correctness: CorrectnessSpec,
         log_path: str,
         device: str,
         hardware: SupportedHardware = SupportedHardware.LOCAL,
@@ -79,6 +81,7 @@ class Evaluator(ABC):
         ref_outputs: list[list[torch.Tensor]],
         ref_mean_latency_ms: float,
         cfg: BenchmarkConfig,
+        correctness: CorrectnessSpec,
         log_path: str,
         device: str,
         execution_device: Any,
@@ -90,6 +93,7 @@ class Evaluator(ABC):
             inputs=inputs,
             ref_outputs=ref_outputs,
             cfg=cfg,
+            correctness=correctness,
             log_path=log_path,
             device=device,
             hardware=hardware,

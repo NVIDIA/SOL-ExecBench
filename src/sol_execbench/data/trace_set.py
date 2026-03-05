@@ -108,8 +108,8 @@ class TraceSet:
         ----------
         path : Optional[str], optional
             Root directory path containing the dataset structure. If None,
-            the global environment variable SOLBENCH_DATASET_PATH is used. If
-            SOLBENCH_DATASET_PATH is not set, ~/.cache/sol_execbench/dataset is used.
+            the global environment variable SOLEXECBENCH_DATASET_PATH is used. If
+            SOLEXECBENCH_DATASET_PATH is not set, ~/.cache/sol_execbench/dataset is used.
 
         Returns
         -------

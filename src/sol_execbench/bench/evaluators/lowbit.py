@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import traceback
-from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -19,6 +18,7 @@ from ...data import (
     EvaluationStatus,
     SupportedHardware,
 )
+from ...data.workload import CorrectnessSpec
 
 from .default import DefaultEvaluator
 from .utils import allocate_outputs, normalize_result
@@ -39,6 +39,7 @@ class LowBitEvaluator(DefaultEvaluator):
         inputs: list[RunnableInputs],
         ref_outputs: list[list[torch.Tensor]],
         cfg: BenchmarkConfig,
+        correctness: CorrectnessSpec,
         log_path: str,
         device: str,
         hardware: SupportedHardware = SupportedHardware.LOCAL,
@@ -48,9 +49,6 @@ class LowBitEvaluator(DefaultEvaluator):
         numerical_incorrect = False
         min_matched_ratio = 1.0
         is_dps = sol_runnable.metadata.destination_passing_style
-
-        if cfg.required_matched_ratio is None:
-            cfg = replace(cfg, required_matched_ratio=0.95)
 
         for trial, inp in enumerate(inputs):
             try:
@@ -108,7 +106,7 @@ class LowBitEvaluator(DefaultEvaluator):
                     )
 
                 abs_err, rel_err, exceeds_tol, matched_ratio = compute_error_stats(
-                    sol_tensor, ref_tensor, cfg
+                    sol_tensor, ref_tensor, correctness
                 )
 
                 if exceeds_tol:

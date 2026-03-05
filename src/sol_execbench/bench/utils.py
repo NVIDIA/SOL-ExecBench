@@ -8,7 +8,6 @@ from typing import Any, Optional
 
 import torch
 
-from .config import BenchmarkConfig
 from ..data import (
     Correctness,
     Definition,
@@ -18,6 +17,7 @@ from ..data import (
     SupportedHardware,
     Workload,
 )
+from ..data.workload import CorrectnessSpec
 from .compile.runnable import Runnable, RunnableInputs
 from ..data.workload import RandomInput, ScalarInput, SafetensorsInput, CustomInput
 from ..data.dtypes import dtype_str_to_torch_dtype
@@ -138,7 +138,7 @@ def normalize_outputs(
 
 
 def compute_error_stats(
-    output: torch.Tensor, reference: torch.Tensor, cfg: BenchmarkConfig
+    output: torch.Tensor, reference: torch.Tensor, correctness: CorrectnessSpec
 ) -> tuple[float, float, bool, float]:
     x = output.to(torch.float32)
     y = reference.to(torch.float32)
@@ -151,15 +151,14 @@ def compute_error_stats(
     if total_elements == 0:
         return 0.0, 0.0, False, 1.0
 
-    required_matched_ratio = (
-        cfg.required_matched_ratio if cfg.required_matched_ratio is not None else 1.0
+    exceeds_tol_mask = (abs_error > correctness.max_atol) & (
+        rel_error > correctness.max_rtol
     )
-    exceeds_tol_mask = (abs_error > cfg.atol) & (rel_error > cfg.rtol)
     exceeds_count = float(exceeds_tol_mask.sum().item())
     matched_ratio = 1.0 - (exceeds_count / float(total_elements))
     matched_ratio = max(0.0, min(1.0, matched_ratio))
 
-    exceeds_tol = matched_ratio < required_matched_ratio
+    exceeds_tol = matched_ratio < correctness.required_matched_ratio
 
     max_abs = float(abs_error.max().item())
     max_rel = float(rel_error.max().item())

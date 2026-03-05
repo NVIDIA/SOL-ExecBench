@@ -178,6 +178,7 @@ class SubprocessWorker:
                             "inputs": bl.inputs,
                             "ref_outputs": bl.outputs,
                             "ref_mean_latency_ms": bl.mean_latency_ms,
+                            "correctness": bl.correctness,
                         }
                     )
 
@@ -316,6 +317,7 @@ def _solution_worker_main(
         inputs_bl: RunnableInputs = loan["inputs"]
         ref_outputs_bl: list[list[torch.Tensor]] = loan["ref_outputs"]
         ref_mean_latency_ms = loan["ref_mean_latency_ms"]
+        correctness = loan["correctness"]
 
         inputs = [inp.clone_tensors() for inp in inputs_bl]
 
@@ -328,6 +330,7 @@ def _solution_worker_main(
             ref_outputs=ref_outputs_bl,
             ref_mean_latency_ms=ref_mean_latency_ms,
             cfg=cfg,
+            correctness=correctness,
             log_path=log_path,
             device=device,
             execution_device=execution_device,

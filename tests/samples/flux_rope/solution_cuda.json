@@ -5,7 +5,7 @@
   "spec": {
     "language": "cuda",
     "target_hardware": ["B200", "LOCAL"],
-    "entry_point": "benchmark_kernel::run",
+    "entry_point": "kernel.cu::run",
     "dependencies": [],
     "compile_options": {
       "cuda_cflags": ["-O3", "--use_fast_math", "-std=c++17"]

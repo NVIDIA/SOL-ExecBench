@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -12,6 +12,7 @@ import torch
 from ..config import BenchmarkConfig
 from ..compile import RunnableInputs
 from ...data import Definition, Evaluation, Solution, Workload
+from ...data.workload import CorrectnessSpec
 
 
 class RunnerError(RuntimeError): ...
@@ -32,6 +33,7 @@ class DeviceBaseline:
     inputs: list[RunnableInputs]
     outputs: list[list[torch.Tensor]]
     mean_latency_ms: float
+    correctness: CorrectnessSpec = field(default_factory=CorrectnessSpec)
 
 
 class Runner(ABC):

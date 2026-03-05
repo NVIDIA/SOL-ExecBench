@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 .ruff_cache
+.pytest_cache
 
 # Virtual environments
 .venv
@@ -24,7 +25,7 @@ wheels/
 .zprofile
 .zshrc
 HEAD
-config
+./config
 hooks
 objects
 refs

@@ -219,6 +219,10 @@ class TestCuteDSLSolutions:
         _run_e2e("jamba_attn_proj", "solution_cute_dsl.json")
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="cuTile requires sm_100+",
+)
 class TestCuTileSolutions:
     """E2E tests for cuTile DSL solutions (require cuda_tile + compilation)."""
 

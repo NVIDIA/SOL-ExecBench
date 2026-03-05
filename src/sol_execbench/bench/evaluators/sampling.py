@@ -28,6 +28,7 @@ from ...data import (
     SupportedHardware,
     Workload,
 )
+from ...data.workload import CorrectnessSpec
 
 from .default import DefaultEvaluator
 from .utils import allocate_outputs, normalize_result
@@ -100,7 +101,7 @@ class SamplingEvaluator(DefaultEvaluator):
         outputs.append([expected_probs])
 
         # Reference is always value-returning style
-        if cfg.profile_baseline:
+        if cfg.time_baseline:
             latencies: list[float] = []
             for inp in inputs:
                 ms = time_runnable(
@@ -126,6 +127,7 @@ class SamplingEvaluator(DefaultEvaluator):
             inputs=inputs,
             outputs=outputs,
             mean_latency_ms=mean_latency_ms,
+            correctness=workload.correctness,
         )
 
     @override
@@ -137,6 +139,7 @@ class SamplingEvaluator(DefaultEvaluator):
         inputs: list[RunnableInputs],
         ref_outputs: list[list[torch.Tensor]],
         cfg: BenchmarkConfig,
+        correctness: CorrectnessSpec,
         log_path: str,
         device: str,
         hardware: SupportedHardware = SupportedHardware.LOCAL,
@@ -155,7 +158,7 @@ class SamplingEvaluator(DefaultEvaluator):
         valid_mask = _compute_valid_sampling_mask(probs, thresholding_method, params)
 
         # Validate correct sampling token set
-        for _ in range(cfg.sampling_validation_trials):
+        for _ in range(correctness.sampling_validation_trials):
             try:
                 if is_dps:
                     out = allocate_outputs(definition, inp.resolved_axes, device)
@@ -239,7 +242,7 @@ class SamplingEvaluator(DefaultEvaluator):
             tvds.append(tvd_i)
 
             max_abs_i, max_rel_i, _, _ = compute_error_stats(
-                sol_freqs[i], expected_probs[i], cfg
+                sol_freqs[i], expected_probs[i], correctness
             )
             max_abs_errors.append(max_abs_i)
             max_rel_errors.append(max_rel_i)
@@ -249,7 +252,7 @@ class SamplingEvaluator(DefaultEvaluator):
         max_abs = max(max_abs_errors)
         max_rel = max(max_rel_errors)
 
-        numerical_incorrect = max_tvd > cfg.sampling_tvd_threshold
+        numerical_incorrect = max_tvd > correctness.sampling_tvd_threshold
         correctness = Correctness(
             max_relative_error=max_rel,
             max_absolute_error=max_abs,

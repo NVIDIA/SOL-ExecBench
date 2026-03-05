@@ -62,6 +62,23 @@ InputSpec = Union[RandomInput, SafetensorsInput, ScalarInput, CustomInput]
 """Union type representing all possible input specification types."""
 
 
+class CorrectnessSpec(BaseModelWithDocstrings):
+    """Correctness specification for a workload.
+
+    Specifies the conditions for a particular problem to be deemed numerically correct against the reference implementation.
+    """
+
+    max_atol: float = Field(default=1e-2)
+    """The maximum absolute error allowed for the problem."""
+    max_rtol: float = Field(default=1e-2)
+    """The maximum relative error allowed for the problem."""
+    sampling_validation_trials: NonNegativeInt = Field(default=100)
+    """The number of sampling validation trials to run."""
+    sampling_tvd_threshold: float = Field(default=0.2)
+    """The threshold for the sampling TVD to be considered correct."""
+    required_matched_ratio: float = Field(default=1.0)
+    """The ratio of elements that must pass the correctness bounds to be considered correct."""
+
 class Workload(BaseModelWithDocstrings):
     """Concrete workload configuration for benchmarking.
 
@@ -77,6 +94,8 @@ class Workload(BaseModelWithDocstrings):
     """Dictionary mapping input names to their data specifications."""
     uuid: NonEmptyString
     """Unique identifier for this specific workload configuration."""
+    correctness: CorrectnessSpec = Field(default=CorrectnessSpec())
+    """Specification for the correctness of the workload."""
 
     @model_validator(mode="after")
     def _validate_inputs(self) -> Workload:

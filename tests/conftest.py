@@ -13,6 +13,25 @@ def _torch_cuda_available() -> bool:
         return False
 
 
+def _gpu_sm_version() -> int:
+    """Return the SM version of the current GPU (e.g. 90, 100), or 0 if unavailable."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 0
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    except ImportError:
+        return 0
+
+
+requires_sm100 = pytest.mark.skipif(
+    _gpu_sm_version() < 100,
+    reason=f"Requires sm_100+ (detected sm_{_gpu_sm_version()})",
+)
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config, items: List[pytest.Item]
 ) -> None:

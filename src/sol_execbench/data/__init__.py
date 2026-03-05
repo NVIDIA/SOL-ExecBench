@@ -1,4 +1,4 @@
-"""Data layer with strongly-typed dataclasses for SolBench."""
+"""Data layer with strongly-typed dataclasses for SolExecBench."""
 
 from .definition import AxisConst, AxisSpec, AxisVar, Definition, TensorSpec
 from .json_utils import (
