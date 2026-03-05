@@ -1,0 +1,18 @@
+{
+  "name": "attn_proj_residual_cutile",
+  "definition": "ai21labs_AI21-Jamba-Reasoning-3B_attention_output_projection_with_residual",
+  "author": "test",
+  "spec": {
+    "language": "python",
+    "target_hardware": ["B200", "LOCAL"],
+    "entry_point": "kernel.py::run",
+    "dependencies": ["torch", "cutile"],
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "kernel.py",
+      "content": "import torch\nimport cuda.tile as ct\nfrom math import ceil\n\nConstInt = ct.Constant[int]\n\n\ndef swizzle_2d_from_bid(M, N, tm, tn, GROUP_SIZE_M, bid):\n    num_bid_m = ct.cdiv(M, tm)\n    num_bid_n = ct.cdiv(N, tn)\n    num_bid_in_group = GROUP_SIZE_M * num_bid_n\n    group_id = bid // num_bid_in_group\n    first_bid_m = group_id * GROUP_SIZE_M\n    group_size_m = min(num_bid_m - first_bid_m, GROUP_SIZE_M)\n    bid_m = first_bid_m + (bid % group_size_m)\n    bid_n = (bid % num_bid_in_group) // group_size_m\n    return bid_m, bid_n\n\n\ndef swizzle_2d(M, N, tm, tn, GROUP_SIZE_M):\n    bid = ct.bid(0)\n    return swizzle_2d_from_bid(M, N, tm, tn, GROUP_SIZE_M, bid)\n\n\n@ct.kernel(num_ctas=ct.ByTarget(sm_100=2))\ndef matmul_kernel(A, B, C, tm: ConstInt, tn: ConstInt, tk: ConstInt):\n    GROUP_SIZE_M = 8\n    M = A.shape[0]\n    N = B.shape[1]\n    bidx, bidy = swizzle_2d(M, N, tm, tn, GROUP_SIZE_M)\n    num_tiles_k = ct.num_tiles(A, axis=1, shape=(tm, tk))\n    accumulator = ct.full((tm, tn), 0, dtype=ct.float32)\n    zero_pad = ct.PaddingMode.ZERO\n    dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype\n    for k in range(num_tiles_k):\n        a = ct.load(A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad).astype(dtype)\n        b = ct.load(B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad).astype(dtype)\n        accumulator = ct.mma(a, b, accumulator)\n    accumulator = ct.astype(accumulator, C.dtype)\n    ct.store(C, index=(bidx, bidy), tile=accumulator)\n\n\n@ct.kernel\ndef add_kernel(A, B, C, tm: ConstInt, tn: ConstInt):\n    bidx = ct.bid(0)\n    bidy = ct.bid(1)\n    zero_pad = ct.PaddingMode.ZERO\n    a = ct.load(A, index=(bidx, bidy), shape=(tm, tn), padding_mode=zero_pad)\n    b = ct.load(B, index=(bidx, bidy), shape=(tm, tn), padding_mode=zero_pad)\n    ct.store(C, index=(bidx, bidy), tile=(a + b))\n\n\n@torch.no_grad()\ndef run(attn_output, residual, o_proj_weight):\n    shape = attn_output.shape\n    M = attn_output.numel() // attn_output.shape[-1]\n    K, N = attn_output.shape[-1], o_proj_weight.shape[0]\n\n    a_flat = attn_output.contiguous().view(M, K)\n    res_flat = residual.contiguous().view(M, N)\n\n    # GEMM via cuTile\n    tm, tn, tk = 128, 256, 64\n    projected = torch.empty((M, N), device=a_flat.device, dtype=a_flat.dtype)\n    grid_x = ceil(M / tm)\n    grid_y = ceil(N / tn)\n    grid = (grid_x * grid_y, 1, 1)\n    ct.launch(torch.cuda.current_stream(), grid, matmul_kernel,\n             (a_flat, o_proj_weight.t().contiguous(), projected, tm, tn, tk))\n\n    # Residual add via cuTile\n    output = torch.empty_like(projected)\n    add_tm, add_tn = 32, 256\n    add_grid = (ceil(M / add_tm), ceil(N / add_tn), 1)\n    ct.launch(torch.cuda.current_stream(), add_grid, add_kernel,\n             (projected, res_flat, output, add_tm, add_tn))\n\n    return output.view(shape)\n"
+    }
+  ]
+}

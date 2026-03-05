@@ -1,0 +1,63 @@
+{
+  "description": "Post-normalization residual connection pattern: output = residual + RMSNorm(sublayer_output). RMSNorm applies learned weight scaling after normalization. Used after both attention and MLP blocks in Olmo3 architecture.",
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Batch size"
+    },
+    "seq_len": {
+      "type": "var",
+      "description": "Sequence length"
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 4096,
+      "description": "Hidden dimension size"
+    }
+  },
+  "inputs": {
+    "sublayer_output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Output from attention or MLP sublayer"
+    },
+    "residual": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Residual connection input"
+    },
+    "weight": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Learned scale parameter for RMSNorm"
+    },
+    "eps": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Epsilon for numerical stability in RMSNorm"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Output with residual added after normalization"
+    }
+  },
+  "reference": "import torch\n\n@torch.no_grad()\ndef run(sublayer_output: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:\n    \"\"\"\n    Post-normalization residual connection: output = residual + RMSNorm(sublayer_output)\n    \n    RMSNorm computation:\n    1. Compute variance: mean of squared values along hidden dimension\n    2. Normalize: x * rsqrt(variance + eps)\n    3. Apply learned scale (weight parameter)\n    4. Add residual connection\n    \n    Args:\n        sublayer_output: Output from attention or MLP sublayer [batch, seq_len, hidden_size]\n        residual: Residual connection input [batch, seq_len, hidden_size]\n        weight: Learned scale parameter [hidden_size]\n        eps: Epsilon for numerical stability\n    \n    Returns:\n        Output tensor with residual added [batch, seq_len, hidden_size]\n    \"\"\"\n    # Store input dtype for final conversion\n    input_dtype = sublayer_output.dtype\n    \n    # RMSNorm computation in float32 for numerical stability\n    normalized = sublayer_output.to(torch.float32)\n    \n    # Compute variance: mean of squared values along hidden dimension\n    # Shape: [batch, seq_len, 1]\n    variance = normalized.pow(2).mean(-1, keepdim=True)\n    \n    # Normalize: x * rsqrt(variance + eps)\n    # rsqrt is more efficient than 1/sqrt\n    normalized = normalized * torch.rsqrt(variance + eps)\n    \n    # Apply learned scale (weight parameter)\n    normalized = weight.to(torch.float32) * normalized\n    \n    # Convert back to input dtype\n    normalized = normalized.to(input_dtype)\n    \n    # Add residual connection\n    output = residual + normalized\n    \n    return output\n",
+  "name": "allenai_Olmo-3-1025-7B_post_norm_residual"
+}

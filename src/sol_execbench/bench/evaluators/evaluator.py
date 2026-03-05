@@ -1,0 +1,121 @@
+"""Abstract base class for kernel evaluators."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any, Optional
+
+import torch
+
+from ..config import BenchmarkConfig
+from ..runner.runner import DeviceBaseline
+from ..utils import make_eval
+from ..compile import Runnable, RunnableInputs
+from ...data import (
+    Correctness,
+    Definition,
+    Evaluation,
+    EvaluationStatus,
+    Performance,
+    SupportedHardware,
+    Workload,
+)
+
+
+class Evaluator(ABC):
+    @classmethod
+    @abstractmethod
+    def can_evaluate(cls, definition: Definition) -> bool: ...
+
+    @classmethod
+    @abstractmethod
+    def build_baseline(
+        cls,
+        definition: Definition,
+        workload: Workload,
+        cfg: BenchmarkConfig,
+        device: str,
+        trace_set_root: Optional[Path] = None,
+        execution_device: Any = None,
+        hardware: SupportedHardware = SupportedHardware.LOCAL,
+    ) -> DeviceBaseline: ...
+
+    @classmethod
+    @abstractmethod
+    def check_correctness(
+        cls,
+        definition: Definition,
+        sol_runnable: Runnable,
+        inputs: list[RunnableInputs],
+        ref_outputs: list[list[torch.Tensor]],
+        cfg: BenchmarkConfig,
+        log_path: str,
+        device: str,
+        hardware: SupportedHardware = SupportedHardware.LOCAL,
+    ) -> tuple[Optional[Correctness], Optional[Evaluation]]: ...
+
+    @classmethod
+    @abstractmethod
+    def eval_performance(
+        cls,
+        definition: Definition,
+        sol_runnable: Runnable,
+        inputs: list[RunnableInputs],
+        ref_mean_latency_ms: float,
+        cfg: BenchmarkConfig,
+        log_path: str,
+        device: str,
+        execution_device: Any,
+        hardware: SupportedHardware = SupportedHardware.LOCAL,
+    ) -> tuple[Performance, Optional[Evaluation]]: ...
+
+    @classmethod
+    def evaluate(
+        cls,
+        definition: Definition,
+        sol_runnable: Runnable,
+        inputs: list[RunnableInputs],
+        ref_outputs: list[list[torch.Tensor]],
+        ref_mean_latency_ms: float,
+        cfg: BenchmarkConfig,
+        log_path: str,
+        device: str,
+        execution_device: Any,
+        hardware: SupportedHardware = SupportedHardware.LOCAL,
+    ) -> Evaluation:
+        correctness, evaluation = cls.check_correctness(
+            definition=definition,
+            sol_runnable=sol_runnable,
+            inputs=inputs,
+            ref_outputs=ref_outputs,
+            cfg=cfg,
+            log_path=log_path,
+            device=device,
+            hardware=hardware,
+        )
+        if evaluation is not None:
+            return evaluation
+
+        performance, evaluation = cls.eval_performance(
+            definition=definition,
+            sol_runnable=sol_runnable,
+            inputs=inputs,
+            ref_mean_latency_ms=ref_mean_latency_ms,
+            cfg=cfg,
+            log_path=log_path,
+            device=device,
+            execution_device=execution_device,
+            hardware=hardware,
+        )
+
+        if evaluation is not None:
+            return evaluation
+
+        return make_eval(
+            status=EvaluationStatus.PASSED,
+            hardware=hardware,
+            log_path=log_path,
+            correctness=correctness,
+            performance=performance,
+        )

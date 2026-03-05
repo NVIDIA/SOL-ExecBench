@@ -1,0 +1,18 @@
+{
+  "name": "rms_norm_triton",
+  "definition": "nvidia_Llama-3.3-Nemotron-70B-Select_rms_norm",
+  "author": "test",
+  "spec": {
+    "language": "triton",
+    "target_hardware": ["B200", "LOCAL"],
+    "entry_point": "kernel.py::run",
+    "dependencies": ["torch", "triton"],
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "kernel.py",
+      "content": "import torch, triton, triton.language as tl\n\n@triton.jit\ndef _fused_add_rmsnorm_kernel(x_ptr, res_ptr, w_ptr, out_ptr,\n                               eps, hidden_size, BLOCK_SIZE: tl.constexpr):\n    row  = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < hidden_size\n\n    # Load as bf16 -- match reference's bfloat16 inputs\n    x_bf16   = tl.load(x_ptr   + row * hidden_size + offs, mask=mask, other=0.0)\n    res_bf16 = tl.load(res_ptr  + row * hidden_size + offs, mask=mask, other=0.0)\n\n    # Step 1: residual add with bf16 rounding (bf16+bf16 -> f32 -> bf16)\n    x_sum_bf16 = (x_bf16.to(tl.float32) + res_bf16.to(tl.float32)).to(tl.bfloat16)\n\n    # Step 2-4: RMSNorm in float32\n    x = x_sum_bf16.to(tl.float32)\n    var     = tl.sum(x * x, axis=0) / hidden_size\n    inv_rms = tl.rsqrt(var + eps)\n\n    # Step 5: round normalized to bf16, multiply weight (also bf16 multiply)\n    w           = tl.load(w_ptr + offs, mask=mask, other=1.0)  # bf16\n    x_norm_bf16 = (x * inv_rms).to(tl.bfloat16)\n    out = (x_norm_bf16.to(tl.float32) * w.to(tl.float32)).to(tl.bfloat16)\n    tl.store(out_ptr + row * hidden_size + offs, out, mask=mask)\n\n@torch.no_grad()\ndef run(hidden_states, residual, weight, eps):\n    shape       = hidden_states.shape\n    hidden_size = shape[-1]\n    n_rows      = hidden_states.numel() // hidden_size\n    x_flat   = hidden_states.contiguous().view(n_rows, hidden_size)\n    res_flat = residual.contiguous().view(n_rows, hidden_size)\n    output   = torch.empty_like(x_flat)\n    BLOCK_SIZE = triton.next_power_of_2(hidden_size)\n    _fused_add_rmsnorm_kernel[(n_rows,)](\n        x_flat, res_flat, weight.contiguous(), output,\n        eps, hidden_size, BLOCK_SIZE=BLOCK_SIZE)\n    return output.view(shape)\n"
+    }
+  ]
+}

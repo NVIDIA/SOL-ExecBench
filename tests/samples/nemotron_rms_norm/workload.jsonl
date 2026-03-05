@@ -1,0 +1,3 @@
+{"axes": {"batch_size": 1, "seq_len": 131}, "inputs": {"hidden_states": {"type": "random"}, "residual": {"type": "random"}, "weight": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-05}}, "uuid": "06179a8b-b919-5fe7-bd31-97a42e4f2da2"}
+{"axes": {"batch_size": 4, "seq_len": 128}, "inputs": {"hidden_states": {"type": "random"}, "residual": {"type": "random"}, "weight": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-05}}, "uuid": "804f8fec-9885-5997-8ddd-b7bbfc34b743"}
+{"axes": {"batch_size": 2, "seq_len": 293}, "inputs": {"hidden_states": {"type": "random"}, "residual": {"type": "random"}, "weight": {"type": "random"}, "eps": {"type": "scalar", "value": 1e-05}}, "uuid": "271336c4-65ed-5fc5-8284-48b010a5a062"}

@@ -1,0 +1,73 @@
+{
+  "name": "moe_index_add_h4096",
+  "op_type": null,
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": null
+    },
+    "seq_len": {
+      "type": "var",
+      "description": null
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 4096,
+      "description": null
+    },
+    "num_experts_per_tok": {
+      "type": "var",
+      "description": null
+    },
+    "batch_seq_len": {
+      "type": "expr",
+      "expression": "batch_size * seq_len",
+      "description": null
+    },
+    "num_selected_tokens": {
+      "type": "expr",
+      "expression": "batch_size * seq_len * num_experts_per_tok",
+      "description": null
+    }
+  },
+  "custom_inputs_entrypoint": "get_inputs",
+  "inputs": {
+    "final_hidden_states": {
+      "shape": [
+        "batch_seq_len",
+        "hidden_size"
+      ],
+      "dtype": "float32",
+      "description": null
+    },
+    "expert_outputs": {
+      "shape": [
+        "num_selected_tokens",
+        "hidden_size"
+      ],
+      "dtype": "float32",
+      "description": null
+    },
+    "token_indices": {
+      "shape": [
+        "num_selected_tokens"
+      ],
+      "dtype": "int64",
+      "description": null
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_seq_len",
+        "hidden_size"
+      ],
+      "dtype": "float32",
+      "description": null
+    }
+  },
+  "reference": "import torch\n\n# Need a custom inputs method since some inputs have non-random values\ndef get_inputs(axes_and_scalars: dict[str, ...], device: torch.device) -> dict[str, torch.Tensor]:\n    \"\"\"Returns the input arguments for the reference forward pass.\"\"\"\n    batch_size = axes_and_scalars[\"batch_size\"]\n    seq_len = axes_and_scalars[\"seq_len\"]\n    hidden_size = axes_and_scalars[\"hidden_size\"]\n    num_experts_per_tok = axes_and_scalars[\"num_experts_per_tok\"]\n\n    batch_seq_len = batch_size * seq_len\n    num_selected_tokens = batch_size * seq_len * num_experts_per_tok\n\n    # Initialize accumulation buffer with random values (not zeros) to detect no-op\n    final_hidden_states = torch.randn(batch_seq_len, hidden_size, device=device)\n\n    # Expert outputs\n    expert_outputs = torch.randn(num_selected_tokens, hidden_size, device=device)\n\n    # Token indices in range [0, batch_seq_len)\n    token_indices = torch.randint(\n        0, batch_seq_len,\n        (num_selected_tokens,),\n        dtype=torch.long,\n        device=device\n    )\n\n    return {\n        \"final_hidden_states\": final_hidden_states,\n        \"expert_outputs\": expert_outputs,\n        \"token_indices\": token_indices,\n    }\n\n\n@torch.no_grad()\ndef run(final_hidden_states, expert_outputs, token_indices):\n    batch_seq_len, hidden_size = final_hidden_states.shape\n\n    # Bounds check\n    assert token_indices.min() >= 0\n    assert token_indices.max() < batch_seq_len\n\n    # Atomic accumulation\n    final_hidden_states.index_add_(dim=0, index=token_indices, source=expert_outputs)\n\n    return final_hidden_states",
+  "tags": [],
+  "description": "Mixture-of-Experts token aggregation using atomic index_add over dim=0. Accumulates expert_outputs into final_hidden_states with hidden_size=4096. Simulates top-k expert routing with possible duplicate token indices.",
+  "constraints": []
+}

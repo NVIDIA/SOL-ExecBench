@@ -1,0 +1,63 @@
+{
+  "description": "Fused residual addition followed by RMSNorm. Computes hidden_states = residual + hidden_states, then applies RMSNorm: output = weight * (x / sqrt(mean(x^2) + eps)). This pattern occurs twice per decoder layer in transformer models.",
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Batch size"
+    },
+    "seq_len": {
+      "type": "var",
+      "description": "Sequence length"
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 8192,
+      "description": "Hidden dimension size"
+    }
+  },
+  "inputs": {
+    "hidden_states": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Output from attention or MLP block"
+    },
+    "residual": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Residual connection tensor"
+    },
+    "weight": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Learnable scaling parameter for RMSNorm"
+    },
+    "eps": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Small constant for numerical stability"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Normalized output tensor"
+    }
+  },
+  "reference": "import torch\n\n@torch.no_grad()\ndef run(hidden_states: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:\n    # Residual addition\n    x = residual + hidden_states\n    \n    # RMSNorm computation in float32 for numerical stability\n    x_fp32 = x.to(torch.float32)\n    \n    # Compute variance (mean of squares) along last dimension\n    variance = x_fp32.pow(2).mean(-1, keepdim=True)\n    \n    # Normalize by RMS (root mean square)\n    x_normalized = x_fp32 * torch.rsqrt(variance + eps)\n    \n    # Apply learned scaling and convert back to bfloat16\n    output = weight * x_normalized.to(torch.bfloat16)\n    \n    return output\n",
+  "name": "nvidia_Llama-3.3-Nemotron-70B-Select_rms_norm"
+}

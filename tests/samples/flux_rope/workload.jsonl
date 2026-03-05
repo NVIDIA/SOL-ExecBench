@@ -1,0 +1,3 @@
+{"axes": {"batch_size": 1, "seq_len": 128}, "inputs": {"query_or_key": {"type": "random"}, "freqs_cos": {"type": "random"}, "freqs_sin": {"type": "random"}}, "uuid": "3378dd76-6148-5997-ba6f-8b790a13548a"}
+{"axes": {"batch_size": 4, "seq_len": 256}, "inputs": {"query_or_key": {"type": "random"}, "freqs_cos": {"type": "random"}, "freqs_sin": {"type": "random"}}, "uuid": "804852f7-c41e-5bdf-8a35-d483dbaf9e6a"}
+{"axes": {"batch_size": 2, "seq_len": 211}, "inputs": {"query_or_key": {"type": "random"}, "freqs_cos": {"type": "random"}, "freqs_sin": {"type": "random"}}, "uuid": "5d04d1cd-7de5-56c0-8dec-6b2c20c5e006"}

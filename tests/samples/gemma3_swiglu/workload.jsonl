@@ -1,0 +1,3 @@
+{"axes": {"batch_size": 1, "seq_len": 128}, "inputs": {"x": {"type": "random"}, "gate_proj": {"type": "random"}, "up_proj": {"type": "random"}}, "uuid": "c8b68cb3-33f7-5136-aa70-2fbbcca2fbd5"}
+{"axes": {"batch_size": 2, "seq_len": 256}, "inputs": {"x": {"type": "random"}, "gate_proj": {"type": "random"}, "up_proj": {"type": "random"}}, "uuid": "f1f964d6-8145-5471-9f38-9ead258c648d"}
+{"axes": {"batch_size": 4, "seq_len": 128}, "inputs": {"x": {"type": "random"}, "gate_proj": {"type": "random"}, "up_proj": {"type": "random"}}, "uuid": "a54d0579-06b5-57ba-9764-398ab091d20f"}

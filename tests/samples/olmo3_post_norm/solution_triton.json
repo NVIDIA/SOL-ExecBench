@@ -1,0 +1,18 @@
+{
+  "name": "post_norm_residual_triton",
+  "definition": "allenai_Olmo-3-1025-7B_post_norm_residual",
+  "author": "test",
+  "spec": {
+    "language": "triton",
+    "target_hardware": ["B200", "LOCAL"],
+    "entry_point": "kernel.py::run",
+    "dependencies": ["torch", "triton"],
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "kernel.py",
+      "content": "import torch, triton, triton.language as tl\n\n@triton.jit\ndef _rmsnorm_residual_kernel(x_ptr, res_ptr, w_ptr, out_ptr,\n                              eps, hidden_size, BLOCK_SIZE: tl.constexpr):\n    row  = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < hidden_size\n\n    x = tl.load(x_ptr + row * hidden_size + offs, mask=mask, other=0.0).to(tl.float32)\n    var = tl.sum(x * x, axis=0) / hidden_size\n    inv_rms = tl.rsqrt(var + eps)\n    w = tl.load(w_ptr + offs, mask=mask, other=1.0).to(tl.float32)\n\n    # Round normalized to bf16 first (matches reference's .to(input_dtype))\n    normed_bf16 = (x * inv_rms * w).to(tl.bfloat16)\n\n    # Residual add: upcast both to f32, add, round to bf16\n    # Matches PyTorch's bf16+bf16 semantics (upcast -> add -> round)\n    res = tl.load(res_ptr + row * hidden_size + offs, mask=mask, other=0.0)\n    out = (normed_bf16.to(tl.float32) + res.to(tl.float32)).to(tl.bfloat16)\n    tl.store(out_ptr + row * hidden_size + offs, out, mask=mask)\n\n@torch.no_grad()\ndef run(sublayer_output, residual, weight, eps):\n    shape = sublayer_output.shape\n    hidden_size = shape[-1]\n    n_rows = sublayer_output.numel() // hidden_size\n    x_flat   = sublayer_output.contiguous().view(n_rows, hidden_size)\n    res_flat = residual.contiguous().view(n_rows, hidden_size)\n    output   = torch.empty_like(x_flat)\n    BLOCK_SIZE = triton.next_power_of_2(hidden_size)\n    _rmsnorm_residual_kernel[(n_rows,)](\n        x_flat, res_flat, weight.contiguous(), output,\n        eps, hidden_size, BLOCK_SIZE=BLOCK_SIZE)\n    return output.view(shape)\n"
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "description": "FLUX's rotary position embedding application that rotates query/key tensors using precomputed cos/sin frequencies. Performs complex rotation: (x1*cos - x2*sin, x1*sin + x2*cos) on paired features. Appears 114+ times per forward pass and is memory-bandwidth bound.",
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Batch size"
+    },
+    "seq_len": {
+      "type": "var",
+      "description": "Sequence length"
+    },
+    "num_attention_heads": {
+      "type": "const",
+      "value": 24,
+      "description": "Number of attention heads"
+    },
+    "attention_head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Dimension per attention head"
+    },
+    "half_head_dim": {
+      "type": "expr",
+      "expression": "attention_head_dim // 2",
+      "description": "Half of head dimension for paired rotation"
+    }
+  },
+  "inputs": {
+    "query_or_key": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_attention_heads",
+        "attention_head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input query or key tensor to be rotated"
+    },
+    "freqs_cos": {
+      "shape": [
+        "seq_len",
+        "attention_head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Precomputed cosine frequencies for rotation"
+    },
+    "freqs_sin": {
+      "shape": [
+        "seq_len",
+        "attention_head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Precomputed sine frequencies for rotation"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_attention_heads",
+        "attention_head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Rotated output tensor with RoPE applied"
+    }
+  },
+  "reference": "import torch\n\n@torch.no_grad()\ndef run(\n    query_or_key: torch.Tensor,\n    freqs_cos: torch.Tensor,\n    freqs_sin: torch.Tensor,\n) -> torch.Tensor:\n    \"\"\"\n    Apply rotary position embeddings to query or key tensor.\n    \n    The rotation is applied using the formula:\n    - Split features into pairs (x1, x2)\n    - Rotate: (x1 * cos - x2 * sin, x1 * sin + x2 * cos)\n    \n    Args:\n        query_or_key: Input tensor of shape (batch, seq_len, num_heads, head_dim)\n        freqs_cos: Cosine frequencies of shape (seq_len, head_dim)\n        freqs_sin: Sine frequencies of shape (seq_len, head_dim)\n        \n    Returns:\n        Rotated tensor of same shape as input\n    \"\"\"\n    # Input shape: (batch, seq_len, num_heads, head_dim)\n    # freqs shape: (seq_len, head_dim)\n    \n    # Reshape frequencies to broadcast correctly\n    # freqs: (seq_len, head_dim) -> (1, seq_len, 1, head_dim)\n    freqs_cos_expanded = freqs_cos.unsqueeze(0).unsqueeze(2)\n    freqs_sin_expanded = freqs_sin.unsqueeze(0).unsqueeze(2)\n    \n    # Split the head_dim into pairs for rotation\n    # This is the complex number rotation in real space\n    # query_or_key: (batch, seq_len, num_heads, head_dim)\n    # Split into: (batch, seq_len, num_heads, head_dim // 2, 2)\n    x_shape = query_or_key.shape\n    x_reshaped = query_or_key.float().reshape(\n        x_shape[0], x_shape[1], x_shape[2], -1, 2\n    )\n    \n    # Split frequencies similarly\n    freqs_cos_reshaped = freqs_cos_expanded.float().reshape(\n        freqs_cos_expanded.shape[0], freqs_cos_expanded.shape[1], freqs_cos_expanded.shape[2], -1, 2\n    )\n    freqs_sin_reshaped = freqs_sin_expanded.float().reshape(\n        freqs_sin_expanded.shape[0], freqs_sin_expanded.shape[1], freqs_sin_expanded.shape[2], -1, 2\n    )\n    \n    # Extract real and imaginary parts\n    x1 = x_reshaped[..., 0]  # (batch, seq_len, num_heads, head_dim // 2)\n    x2 = x_reshaped[..., 1]  # (batch, seq_len, num_heads, head_dim // 2)\n    \n    cos1 = freqs_cos_reshaped[..., 0]  # (1, seq_len, 1, head_dim // 2)\n    cos2 = freqs_cos_reshaped[..., 1]  # (1, seq_len, 1, head_dim // 2)\n    sin1 = freqs_sin_reshaped[..., 0]  # (1, seq_len, 1, head_dim // 2)\n    sin2 = freqs_sin_reshaped[..., 1]  # (1, seq_len, 1, head_dim // 2)\n    \n    # Apply rotation: (x1, x2) -> (x1*cos - x2*sin, x1*sin + x2*cos)\n    # This is the complex multiplication: (x1 + ix2) * (cos + isin)\n    out1 = x1 * cos1 - x2 * sin1\n    out2 = x1 * sin2 + x2 * cos2\n    \n    # Stack back together\n    output = torch.stack([out1, out2], dim=-1)\n    \n    # Reshape back to original shape\n    output = output.reshape(x_shape)\n    \n    # Convert back to original dtype\n    output = output.to(torch.bfloat16)\n    \n    return output\n",
+  "name": "black-forest-labs_FLUX.1-schnell_flux_rope_apply_rotation"
+}

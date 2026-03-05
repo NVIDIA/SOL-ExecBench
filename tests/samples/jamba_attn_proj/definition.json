@@ -1,0 +1,59 @@
+{
+  "description": "Fused attention output projection (o_proj) with residual addition. After computing attention outputs, this operation performs the final linear projection and adds the residual connection. The projection is a matmul (hidden_size x hidden_size) fused with elementwise residual add to eliminate intermediate memory traffic.",
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Batch size"
+    },
+    "seq_len": {
+      "type": "var",
+      "description": "Sequence length"
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 2560,
+      "description": "Hidden dimension size"
+    }
+  },
+  "inputs": {
+    "attn_output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output tensor after reshape from multi-head format"
+    },
+    "residual": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Residual tensor from before attention layer"
+    },
+    "o_proj_weight": {
+      "shape": [
+        "hidden_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Output projection weight matrix (hidden_size x hidden_size)"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Output with projection and residual added"
+    }
+  },
+  "reference": "import torch\n\n\n@torch.no_grad()\ndef run(\n    attn_output: torch.Tensor,\n    residual: torch.Tensor,\n    o_proj_weight: torch.Tensor,\n) -> torch.Tensor:\n    \"\"\"\n    Fused attention output projection with residual addition.\n    \n    This performs:\n    1. Linear projection: attn_output @ o_proj_weight.T\n    2. Residual addition: projected + residual\n    \n    In a custom CUDA kernel, these operations would be fused to:\n    - Compute matmul tiles in registers\n    - Add residual directly to register-held results\n    - Write final result to global memory (eliminating intermediate write)\n    \n    Args:\n        attn_output: Attention output of shape (batch, seq_len, hidden_size)\n        residual: Original input before attention of shape (batch, seq_len, hidden_size)\n        o_proj_weight: Output projection weight of shape (hidden_size, hidden_size)\n    \n    Returns:\n        Output with residual added, shape (batch, seq_len, hidden_size)\n    \"\"\"\n    # Linear projection: (batch, seq_len, hidden_size) @ (hidden_size, hidden_size).T\n    # -> (batch, seq_len, hidden_size)\n    projected = torch.matmul(attn_output, o_proj_weight.t())\n    \n    # Residual addition\n    output = projected + residual\n    \n    return output\n",
+  "name": "ai21labs_AI21-Jamba-Reasoning-3B_attention_output_projection_with_residual"
+}

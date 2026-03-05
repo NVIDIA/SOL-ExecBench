@@ -1,0 +1,58 @@
+[project]
+name = "sol-execbench"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.10.0",
+    "torchvision>=0.24.1",
+    "ninja>=1.13.0",
+    "cuda-tile==1.1.0",
+    "nvidia-cudnn-frontend==1.18.0",
+    "nvidia-cutlass-dsl[cu13]==4.4.1",
+    "pydantic>=2.12.5",
+    "safetensors>=0.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "requires_torch_cuda: test requires a CUDA-capable GPU via PyTorch",
+    "cpp: test compiles C++/CUDA extensions (slow, requires compiler toolchain)",
+]
+
+[tool.ruff]
+# Exclude generated code from linting and formatting
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "*.egg-info",
+    ".ruff_cache",
+    "data",
+    "tests/data"
+]
+
+[tool.ruff.lint]
+ignore = ["E741"]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+

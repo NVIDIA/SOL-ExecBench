@@ -1,0 +1,26 @@
+{
+  "name": "my_rmsnorm_triton",
+  "definition": "rmsnorm_h4096",
+  "author": "alice",
+  "description": "Optimized Triton implementation of RMS normalization with fused operations",
+  "spec": {
+    "language": "triton",
+    "target_hardware": [
+      "B200",
+      "LOCAL"
+    ],
+    "entry_point": "kernel.py::rmsnorm_fwd",
+    "dependencies": [
+      "triton",
+      "torch"
+    ],
+    "destination_passing_style": true,
+    "binding": null
+  },
+  "sources": [
+    {
+      "path": "kernel.py",
+      "content": "import torch\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef _rmsnorm_fwd_kernel(\n    x_ptr,\n    output_ptr,\n    weight_ptr,\n    eps,\n    n_cols,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Forward pass for RMS normalization.\"\"\"\n    row_idx = tl.program_id(0)\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n    \n    # Load input\n    x = tl.load(x_ptr + row_idx * n_cols + col_offsets, mask=mask, other=0.0)\n    \n    # Compute RMS\n    x_squared = x * x\n    mean_squared = tl.sum(x_squared, axis=0) / n_cols\n    rms = tl.sqrt(mean_squared + eps)\n    \n    # Normalize\n    x_normed = x / rms\n    \n    # Apply weight\n    weight = tl.load(weight_ptr + col_offsets, mask=mask, other=1.0)\n    output = x_normed * weight\n    \n    # Store output\n    tl.store(output_ptr + row_idx * n_cols + col_offsets, output, mask=mask)\n\ndef rmsnorm_fwd(x, weight, output):\n    \"\"\"Wrapper for Triton kernel (destination-passing style).\"\"\"\n    batch_size, n_cols = x.shape\n    \n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n    grid = (batch_size,)\n    \n    _rmsnorm_fwd_kernel[grid](\n        x, output, weight, 1e-6, n_cols,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n"
+    }
+  ]
+}

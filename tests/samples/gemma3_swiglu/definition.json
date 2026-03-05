@@ -1,0 +1,63 @@
+{
+  "description": "Gemma3's fused gate and up projection followed by GELU-tanh activation and element-wise multiplication. Computes gelu_tanh(x @ gate_proj.T) * (x @ up_proj.T) where gate_proj and up_proj are weight matrices. This fuses two parallel linear projections from hidden_size=3072 to intermediate_size=24576, followed by GELU activation on gate output and element-wise multiplication with up output.",
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Batch size"
+    },
+    "seq_len": {
+      "type": "var",
+      "description": "Sequence length"
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 3072,
+      "description": "Input hidden dimension"
+    },
+    "intermediate_size": {
+      "type": "const",
+      "value": 24576,
+      "description": "Intermediate MLP dimension"
+    }
+  },
+  "inputs": {
+    "x": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input hidden states"
+    },
+    "gate_proj": {
+      "shape": [
+        "intermediate_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Gate projection weight matrix"
+    },
+    "up_proj": {
+      "shape": [
+        "intermediate_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Up projection weight matrix"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "intermediate_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Output after fused gate-up projection with GELU-tanh activation"
+    }
+  },
+  "reference": "import torch\nimport math\n\n@torch.no_grad()\ndef run(x: torch.Tensor, gate_proj: torch.Tensor, up_proj: torch.Tensor) -> torch.Tensor:\n    \"\"\"\n    Fused gate and up projection with GELU-tanh activation.\n    \n    Computes: gelu_tanh(x @ gate_proj.T) * (x @ up_proj.T)\n    \n    Args:\n        x: Input tensor of shape (batch_size, seq_len, hidden_size)\n        gate_proj: Gate projection weights of shape (intermediate_size, hidden_size)\n        up_proj: Up projection weights of shape (intermediate_size, hidden_size)\n    \n    Returns:\n        Output tensor of shape (batch_size, seq_len, intermediate_size)\n    \"\"\"\n    # Compute gate projection: x @ gate_proj.T\n    # x: (batch_size, seq_len, hidden_size)\n    # gate_proj: (intermediate_size, hidden_size)\n    # gate_output: (batch_size, seq_len, intermediate_size)\n    gate_output = torch.matmul(x, gate_proj.t())\n    \n    # Compute up projection: x @ up_proj.T\n    # up_output: (batch_size, seq_len, intermediate_size)\n    up_output = torch.matmul(x, up_proj.t())\n    \n    # Apply GELU with tanh approximation to gate output\n    # GELU_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))\n    sqrt_2_over_pi = math.sqrt(2.0 / math.pi)\n    gate_float = gate_output.to(torch.float32)\n    inner = sqrt_2_over_pi * (gate_float + 0.044715 * gate_float.pow(3))\n    activated_gate = 0.5 * gate_float * (1.0 + torch.tanh(inner))\n    activated_gate = activated_gate.to(gate_output.dtype)\n    \n    # Element-wise multiplication: activated_gate * up_output\n    output = activated_gate * up_output\n    \n    return output\n",
+  "name": "google_gemma-3-12b-it_gemma3_fused_gate_up_projection_with_swiglu"
+}

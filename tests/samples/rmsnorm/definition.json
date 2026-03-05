@@ -1,0 +1,50 @@
+{
+  "name": "rmsnorm_h4096",
+  "op_type": "rmsnorm",
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": null
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 4096,
+      "description": null
+    }
+  },
+  "custom_inputs_entrypoint": null,
+  "inputs": {
+    "hidden_states": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": null
+    },
+    "weight": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": null
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": null
+    }
+  },
+  "reference": "import torch\n\n@torch.no_grad()\ndef run(hidden_states, weight):\n    batch_size, hidden_size = hidden_states.shape\n    # Check constants\n    assert hidden_size == 4096\n\n    EPS = 1e-5\n\n    x = hidden_states.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    y = (x * inv_rms) * weight.to(torch.float32)\n    return y.to(hidden_states.dtype)",
+  "tags": [
+    "status:verified",
+    "model:llama-3.1-8b"
+  ],
+  "description": "Root Mean Square Normalization with hidden_size=4096. Captured from Llama-3.1-8B. Epsilon is fixed at 1e-5.",
+  "constraints": []
+}

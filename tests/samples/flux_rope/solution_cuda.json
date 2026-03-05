@@ -1,0 +1,22 @@
+{
+  "name": "flux_rope_cuda",
+  "definition": "black-forest-labs_FLUX.1-schnell_flux_rope_apply_rotation",
+  "author": "test",
+  "spec": {
+    "language": "cuda",
+    "target_hardware": ["B200", "LOCAL"],
+    "entry_point": "benchmark_kernel::run",
+    "dependencies": [],
+    "compile_options": {
+      "cuda_cflags": ["-O3", "--use_fast_math", "-std=c++17"]
+    },
+    "destination_passing_style": false,
+    "binding": "torch"
+  },
+  "sources": [
+    {
+      "path": "kernel.cu",
+      "content": "#include <torch/extension.h>\n#include <cuda_bf16.h>\n#include <c10/cuda/CUDAGuard.h>\n\n__global__ void rope_kernel(\n    const __nv_bfloat16* __restrict__ x,\n    const __nv_bfloat16* __restrict__ cos_f,\n    const __nv_bfloat16* __restrict__ sin_f,\n    __nv_bfloat16* __restrict__ out,\n    int B, int S, int H, int head_dim)\n{\n    int idx      = blockIdx.x * blockDim.x + threadIdx.x;\n    int half_dim = head_dim / 2;\n    if (idx >= B * S * H * half_dim) return;\n\n    int pair  = idx % half_dim;\n    int h     = (idx / half_dim) % H;\n    int s     = (idx / half_dim / H) % S;\n    int b     = idx / half_dim / H / S;\n    int base  = ((b * S + s) * H + h) * head_dim + pair * 2;\n    int fbase = s * head_dim + pair * 2;\n\n    float x1 = __bfloat162float(x[base]),      x2 = __bfloat162float(x[base+1]);\n    float c1 = __bfloat162float(cos_f[fbase]),  c2 = __bfloat162float(cos_f[fbase+1]);\n    float s1 = __bfloat162float(sin_f[fbase]),  s2 = __bfloat162float(sin_f[fbase+1]);\n\n    out[base]   = __float2bfloat16(x1*c1 - x2*s1);\n    out[base+1] = __float2bfloat16(x1*s2 + x2*c2);\n}\n\ntorch::Tensor run(torch::Tensor query_or_key,\n                  torch::Tensor freqs_cos, torch::Tensor freqs_sin) {\n    const at::cuda::CUDAGuard guard(query_or_key.device());\n    auto B = query_or_key.size(0), S = query_or_key.size(1);\n    auto H = query_or_key.size(2), head_dim = query_or_key.size(3);\n    auto output = torch::empty_like(query_or_key);\n    int total_pairs = B * S * H * (head_dim / 2);\n    rope_kernel<<<(total_pairs + 255) / 256, 256>>>(\n        (const __nv_bfloat16*)query_or_key.data_ptr(),\n        (const __nv_bfloat16*)freqs_cos.contiguous().data_ptr(),\n        (const __nv_bfloat16*)freqs_sin.contiguous().data_ptr(),\n        (__nv_bfloat16*)output.data_ptr(),\n        B, S, H, head_dim);\n    return output;\n}\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n    m.def(\"run\", &run, \"FLUX RoPE apply rotation (CUDA)\");\n}\n"
+    }
+  ]
+}
