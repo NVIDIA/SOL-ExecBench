@@ -32,8 +32,8 @@ from .reward_hack import (
     check_monkey_patch,
     check_stream_injection,
 )
+from ..correctness import compute_error_stats
 from ..utils import (
-    compute_error_stats,
     gen_inputs,
     load_safetensors,
     make_eval,

@@ -31,5 +31,7 @@ objects
 refs
 
 # datasets
-data/flashinfer-trace
-data/benchmark
+data/*
+
+# output
+out/

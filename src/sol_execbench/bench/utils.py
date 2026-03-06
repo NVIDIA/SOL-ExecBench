@@ -32,7 +32,6 @@ from ..data import (
     SupportedHardware,
     Workload,
 )
-from ..data.workload import CorrectnessSpec
 from .compile.runnable import Runnable, RunnableInputs
 from ..data.workload import RandomInput, ScalarInput, SafetensorsInput, CustomInput
 from ..data.dtypes import dtype_str_to_torch_dtype
@@ -150,35 +149,6 @@ def normalize_outputs(
     raise RuntimeError(
         "Unexpected return type; must be Tensor, scalar, or dict[name -> Tensor/scalar]"
     )
-
-
-def compute_error_stats(
-    output: torch.Tensor, reference: torch.Tensor, correctness: CorrectnessSpec
-) -> tuple[float, float, bool, float]:
-    x = output.to(torch.float32)
-    y = reference.to(torch.float32)
-
-    eps = 1e-8
-    abs_error = torch.abs(x - y)
-    rel_error = abs_error / (torch.abs(y) + eps)
-
-    total_elements = abs_error.numel()
-    if total_elements == 0:
-        return 0.0, 0.0, False, 1.0
-
-    exceeds_tol_mask = (abs_error > correctness.max_atol) & (
-        rel_error > correctness.max_rtol
-    )
-    exceeds_count = float(exceeds_tol_mask.sum().item())
-    matched_ratio = 1.0 - (exceeds_count / float(total_elements))
-    matched_ratio = max(0.0, min(1.0, matched_ratio))
-
-    exceeds_tol = matched_ratio < correctness.required_matched_ratio
-
-    max_abs = float(abs_error.max().item())
-    max_rel = float(rel_error.max().item())
-
-    return max_abs, max_rel, exceeds_tol, matched_ratio
 
 
 def is_sampling_operation(definition: Definition) -> bool:

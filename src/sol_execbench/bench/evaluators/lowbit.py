@@ -24,7 +24,8 @@ import torch
 from typing_extensions import override
 
 from ..config import BenchmarkConfig
-from ..utils import compute_error_stats, make_eval
+from ..correctness import compute_error_stats
+from ..utils import make_eval
 from ..compile import Runnable, RunnableInputs
 from ...data import (
     Correctness,

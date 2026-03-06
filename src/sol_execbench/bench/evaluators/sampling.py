@@ -28,8 +28,8 @@ from ..config import BenchmarkConfig
 from ..compile import RunnableInputs
 from ..runner.runner import BaselineHandle, DeviceBaseline
 from ..timing import time_runnable
+from ..correctness import compute_error_stats
 from ..utils import (
-    compute_error_stats,
     gen_inputs,
     load_safetensors,
     make_eval,

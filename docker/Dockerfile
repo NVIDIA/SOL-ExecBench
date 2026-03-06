@@ -22,6 +22,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # Install CUTLASS (headers used by cutlass-dsl and solutions)
 RUN git clone --depth 1 -b v4.4.1 https://github.com/NVIDIA/cutlass.git /usr/local/cutlass
+ENV CUTLASS_DIR="/usr/local/cutlass" \
+    CPLUS_INCLUDE_PATH="/usr/local/cutlass/include"
 
 # User and directory setup
 ARG HOST_UID=1000
@@ -50,6 +52,9 @@ ENV UV_LINK_MODE=copy \
 COPY --chown=${HOST_UID}:${HOST_GID} pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/home/${HOST_USER}/.cache/uv,uid=${HOST_UID},gid=${HOST_GID} \
     uv sync --frozen --no-install-project
+
+# Add installed cudnn-frontend
+ENV CPLUS_INCLUDE_PATH="${CPLUS_INCLUDE_PATH};${UV_PROJECT_ENVIRONMENT}/lib/python3.12/site-packages/include"
     
 # Copy SOL ExecBench problem dataset including safetensors blobs.
 # Requires: ./scripts/download_flashinfer_bench.sh
@@ -60,8 +65,6 @@ COPY --chown=${HOST_UID}:${HOST_GID} src/ ./src/
 
 ENV PATH="/venv/bin:${PATH}" \
     PYTHONPATH="/sol-execbench/src" \
-    CUTLASS_DIR="/usr/local/cutlass" \
-    CPLUS_INCLUDE_PATH="/usr/local/cutlass/include" \
     SOLEXECBENCH_BENCHMARK_DIR="/opt/sol-execbench/benchmark"
 
 ENTRYPOINT ["/entrypoint.sh"]
