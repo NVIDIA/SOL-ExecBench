@@ -100,6 +100,20 @@ class LowBitEvaluator(DefaultEvaluator):
                         log_path=log_path,
                     )
 
+                # Non-zero output check (CUTLASS pattern)
+                ref_norm = torch.linalg.vector_norm(ref_tensor.to(torch.float32))
+                if ref_norm.item() > 0 and torch.linalg.vector_norm(sol_tensor.to(torch.float32)).item() == 0:
+                    correctness = Correctness(
+                        max_relative_error=float("inf"),
+                        max_absolute_error=float(ref_norm.item()),
+                    )
+                    return correctness, make_eval(
+                        status=EvaluationStatus.INCORRECT_NUMERICAL,
+                        hardware=hardware,
+                        log_path=log_path,
+                        correctness=correctness,
+                    )
+
                 non_finite_err_val: Optional[float] = None
                 if torch.isinf(sol_tensor).any().item():
                     non_finite_err_val = float("inf")

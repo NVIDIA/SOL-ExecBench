@@ -47,6 +47,13 @@ def compute_error_stats(
     exceeds_tol = matched_ratio < correctness.required_matched_ratio
 
     max_abs = float(abs_error.max().item())
+
+    # Hard ceiling on max absolute error (cuDNN pattern).
+    # Prevents accepting solutions where most elements match but rare outliers
+    # have arbitrarily large errors.
+    if correctness.max_error_cap is not None and max_abs > correctness.max_error_cap:
+        exceeds_tol = True
+
     # Relative error using max_atol as floor to avoid division-by-near-zero
     rel_error = abs_error / torch.clamp(torch.abs(y), min=correctness.max_atol)
     max_rel = float(rel_error.max().item())

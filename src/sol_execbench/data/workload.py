@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, Union
+from typing import Literal, Optional, Union
 
 from pydantic import model_validator, Field
 
@@ -93,6 +93,9 @@ class CorrectnessSpec(BaseModelWithDocstrings):
     """The threshold for the sampling TVD to be considered correct."""
     required_matched_ratio: float = Field(default=1.0)
     """The ratio of elements that must pass the correctness bounds to be considered correct."""
+    max_error_cap: Optional[float] = Field(default=None)
+    """Hard ceiling on maximum absolute error. If set, correctness fails when any
+    element's absolute error exceeds this cap, regardless of matched ratio."""
 
 class Workload(BaseModelWithDocstrings):
     """Concrete workload configuration for benchmarking.

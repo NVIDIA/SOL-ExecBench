@@ -21,12 +21,16 @@ from sol_execbench.data.workload import CorrectnessSpec
 
 
 def _spec(
-    max_atol: float = 1e-5, max_rtol: float = 1e-5, required_matched_ratio: float = 1.0
+    max_atol: float = 1e-5,
+    max_rtol: float = 1e-5,
+    required_matched_ratio: float = 1.0,
+    max_error_cap: float = None,
 ) -> CorrectnessSpec:
     return CorrectnessSpec(
         max_atol=max_atol,
         max_rtol=max_rtol,
         required_matched_ratio=required_matched_ratio,
+        max_error_cap=max_error_cap,
     )
 
 
@@ -322,3 +326,58 @@ class TestComputeErrorStats:
         _, _, exceeds, ratio = compute_error_stats(out, ref, _spec())
         assert exceeds
         assert ratio == 0.0
+
+    # ------------------------------------------------------------------
+    # max_error_cap (cuDNN pattern)
+    # ------------------------------------------------------------------
+
+    def test_max_error_cap_no_cap(self):
+        """Without cap, large outlier errors pass if matched ratio is met."""
+        ref = torch.ones(100)
+        out = ref.clone()
+        out[0] = 100.0  # huge error on one element
+        cfg = _spec(max_atol=1e-5, max_rtol=1e-5, required_matched_ratio=0.95)
+        _, _, exceeds, ratio = compute_error_stats(out, ref, cfg)
+        # 99/100 match → ratio=0.99 ≥ 0.95 → passes (no cap)
+        assert not exceeds
+        assert ratio == pytest.approx(0.99, rel=1e-6)
+
+    def test_max_error_cap_passes(self):
+        """Error below cap passes normally."""
+        ref = torch.ones(100)
+        out = ref.clone()
+        out[0] = 1.5  # abs_error = 0.5, below cap of 1.0
+        cfg = _spec(
+            max_atol=1e-5, max_rtol=1e-5,
+            required_matched_ratio=0.95, max_error_cap=1.0,
+        )
+        _, _, exceeds, ratio = compute_error_stats(out, ref, cfg)
+        # 99/100 match → ratio=0.99 ≥ 0.95, max_abs=0.5 ≤ 1.0 → passes
+        assert not exceeds
+
+    def test_max_error_cap_fails(self):
+        """Error above cap fails even with good matched ratio."""
+        ref = torch.ones(100)
+        out = ref.clone()
+        out[0] = 100.0  # abs_error = 99.0, way above cap of 1.0
+        cfg = _spec(
+            max_atol=1e-5, max_rtol=1e-5,
+            required_matched_ratio=0.95, max_error_cap=1.0,
+        )
+        _, _, exceeds, ratio = compute_error_stats(out, ref, cfg)
+        # 99/100 match → ratio=0.99 ≥ 0.95 BUT max_abs=99.0 > 1.0 → fails
+        assert exceeds
+        assert ratio == pytest.approx(0.99, rel=1e-6)
+
+    def test_max_error_cap_boundary(self):
+        """Error exactly at cap passes (not strictly greater)."""
+        ref = torch.tensor([1.0])
+        out = torch.tensor([2.0])  # abs_error = 1.0, exactly at cap
+        cfg = _spec(
+            max_atol=1e-5, max_rtol=1e-5,
+            required_matched_ratio=0.0, max_error_cap=1.0,
+        )
+        max_abs, _, exceeds, _ = compute_error_stats(out, ref, cfg)
+        assert max_abs == pytest.approx(1.0, abs=1e-6)
+        # 1.0 is NOT > 1.0, so cap should not trigger
+        assert not exceeds
