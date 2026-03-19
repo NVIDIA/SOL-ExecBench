@@ -13,10 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 from pathlib import Path
 from typing import List
 
 import pytest
+
+
+def _cute_dsl_available() -> bool:
+    """Return True if nvidia-cutlass-dsl (cutlass package) is importable."""
+    return importlib.util.find_spec("cutlass") is not None
 
 
 def _gpu_sm_version() -> int:
@@ -41,14 +47,22 @@ requires_sm100 = pytest.mark.skipif(
 def pytest_collection_modifyitems(
     config: pytest.Config, items: List[pytest.Item]
 ) -> None:
-    """Skip tests based on hardware availability."""
+    """Skip tests based on hardware and optional-dependency availability."""
     sm_version = _gpu_sm_version()
+    cute_dsl_ok = _cute_dsl_available()
 
     for item in items:
         if sm_version < 100 and any(item.iter_markers(name="requires_cutile")):
             item.add_marker(
                 pytest.mark.skip(
                     reason=f"cuTile requires sm_100+ (detected sm_{sm_version})"
+                )
+            )
+        if not cute_dsl_ok and any(item.iter_markers(name="requires_cute_dsl")):
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="nvidia-cutlass-dsl not installed; "
+                    "install with: pip install 'sol-execbench[cute-dsl]'"
                 )
             )
 

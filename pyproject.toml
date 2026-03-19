@@ -14,12 +14,16 @@ dependencies = [
     "ninja>=1.13.0",
     "cuda-tile==1.1.0",
     "nvidia-cudnn-frontend==1.18.0",
-    "nvidia-cutlass-dsl[cu13]==4.4.1",
     "pydantic>=2.12.5",
     "safetensors>=0.7.0",
     "click>=8.0",
     "rich>=13.0",
     "datasets>=4.8.2",
+]
+
+[project.optional-dependencies]
+cutlass-dsl = [
+    "nvidia-cutlass-dsl[cu13]==4.4.1",
 ]
 
 [project.scripts]
@@ -36,6 +40,7 @@ addopts = "-n auto --dist loadgroup"
 markers = [
     "cpp: test compiles C++/CUDA extensions (slow, requires compiler toolchain)",
     "requires_cutile: test requires cuTile (sm_100+ / Blackwell GPU)",
+    "requires_cute_dsl: test requires nvidia-cutlass-dsl (install with: pip install sol-execbench[cute-dsl])",
 ]
 
 [tool.ruff]

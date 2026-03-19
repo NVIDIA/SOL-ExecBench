@@ -217,6 +217,36 @@ _CPP_LANGUAGES = {
     SupportedLanguages.CUDNN,
     SupportedLanguages.CUBLAS,
 }
+
+# ── CuTe DSL availability check ──────────────────────────────────────────────
+# nvidia-cutlass-dsl is an optional dependency. Detect it before attempting to
+# import user code that depends on it, so we can emit a clear error rather than
+# a confusing ImportError deep inside the user module.
+if SupportedLanguages.CUTE_DSL in _solution.spec.languages:
+    import importlib.util as _iutil
+
+    if _iutil.find_spec("cutlass") is None:
+        _missing_msg = (
+            "nvidia-cutlass-dsl is not installed but this solution requires it "
+            "(language='cute_dsl'). "
+            "Install it with: pip install 'sol-execbench[cute-dsl]'"
+        )
+        for _wl in workloads:
+            _emit(
+                Trace(
+                    definition=definition.name,
+                    solution=_solution_name,
+                    workload=_wl,
+                    evaluation=_make_eval(
+                        EvaluationStatus.RUNTIME_ERROR,
+                        _device,
+                        None,
+                        extra_msg=_missing_msg,
+                    ),
+                )
+            )
+        sys.exit(0)
+
 if any(lang in _CPP_LANGUAGES for lang in _solution.spec.languages):
     _so_path = STAGING_DIR / "benchmark_kernel.so"
     if not _so_path.exists():

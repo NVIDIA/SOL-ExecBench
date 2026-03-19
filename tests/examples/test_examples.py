@@ -117,6 +117,7 @@ _EXAMPLES = [
         problem="jamba_attn_proj",
         solution_file="solution_cute_dsl.json",
         expected_count=3,
+        extra_markers=["requires_cute_dsl"],
     ),
     Example(
         test_id="jamba_attn_proj_cutile",
