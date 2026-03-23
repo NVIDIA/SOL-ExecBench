@@ -36,10 +36,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # Create user and setup directories
 # Note: Host GID may already exist in base image, so we use -f (force) flag
-RUN groupadd -f -g ${HOST_GID} ${HOST_USER} && \
-    useradd -m -u ${HOST_UID} -g ${HOST_GID} -s /bin/bash ${HOST_USER} && \
-    mkdir -p /sol-execbench && mkdir -p /venv &&\
-    chown -R ${HOST_UID}:${HOST_GID} /home/${HOST_USER} /sol-execbench /venv && \
+# When running as root (UID 0), skip user creation since root already exists
+RUN if [ "${HOST_UID}" != "0" ]; then \
+        groupadd -f -g ${HOST_GID} ${HOST_USER} && \
+        useradd -m -u ${HOST_UID} -g ${HOST_GID} -s /bin/bash ${HOST_USER}; \
+    fi && \
+    mkdir -p /sol-execbench && mkdir -p /venv && \
+    chown -R ${HOST_UID}:${HOST_GID} /sol-execbench /venv && \
     echo "${HOST_USER} ALL=(ALL) NOPASSWD: /usr/bin/nvidia-smi" >> /etc/sudoers
 
 # Copy and set up entrypoint while still root (avoid switching back)
