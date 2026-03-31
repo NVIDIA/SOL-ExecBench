@@ -38,11 +38,29 @@ requires_sm100 = pytest.mark.skipif(
 )
 
 
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line(
+        "markers",
+        "timing_serial: GPU timing tests (skipped by default; run with: pytest tests -m timing_serial -n 0)",
+    )
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config, items: List[pytest.Item]
 ) -> None:
-    """Skip tests based on hardware availability."""
+    """Skip tests based on hardware availability.
+
+    Also skips timing_serial tests unless explicitly selected with -m.
+    """
     sm_version = _gpu_sm_version()
+    skip_timing = pytest.mark.skip(
+        reason="timing_serial tests skipped by default; run with: pytest tests -m timing_serial -n 0"
+    )
+
+    # If the user passed -m that includes timing_serial, don't auto-skip them.
+    markexpr = config.getoption("-m", default="")
+    timing_selected = "timing_serial" in markexpr
 
     for item in items:
         if sm_version < 100 and any(item.iter_markers(name="requires_cutile")):
@@ -51,6 +69,8 @@ def pytest_collection_modifyitems(
                     reason=f"cuTile requires sm_100+ (detected sm_{sm_version})"
                 )
             )
+        if "timing_serial" in item.keywords and not timing_selected:
+            item.add_marker(skip_timing)
 
 
 @pytest.fixture
