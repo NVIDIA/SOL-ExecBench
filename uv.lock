@@ -343,6 +343,22 @@ wheels = [
 ]
 
 [[package]]
+name = "cupti-python"
+version = "13.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cuda-bindings" },
+    { name = "numpy" },
+    { name = "nvidia-cuda-cupti" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9d/61/77daadc1b9327ce48e15569aa395b20bef55e8b1f9b6df11982f40b6d70d/cupti_python-13.0.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:0881f464a02f7fdd4d4579f808298159cd6cb1530b142dea25b9a1179884440d", size = 835158, upload-time = "2025-12-22T11:28:54.349Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/03/8ac5665795e995ab37e0be132a2ea32088c6a6294da709039b11a9029c25/cupti_python-13.0.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:866900d19ac48b1ea1a24e7399a44db82a6716888a250c94b20d14f2f872b96e", size = 881406, upload-time = "2025-12-22T11:28:56.35Z" },
+    { url = "https://files.pythonhosted.org/packages/53/1d/e2054e46395a92760bc8b7825ed6a06464066da177fee8aa0e2b284642df/cupti_python-13.0.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:a544721d90209bcf4d59d2792f6e4735cfc36ee43cb41bdf34664f36bb448be0", size = 830199, upload-time = "2025-12-22T11:28:58.835Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/12/d2662e781eeefee4838e732d29a6b0d874b95692f28525365d176e9239f5/cupti_python-13.0.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:1bafb462d2d7fb9c360ad3cabbdce23b394258ba235eb4b814c3aaffe61ad8df", size = 869018, upload-time = "2025-12-22T11:29:03.035Z" },
+]
+
+[[package]]
 name = "datasets"
 version = "4.8.2"
 source = { registry = "https://pypi.org/simple" }
@@ -937,6 +953,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/2a/80353b103fc20ce05ef51e928daed4b6015db4aaa9162ed0997090fe2250/nvidia_cuda_cupti-13.0.85-py3-none-manylinux_2_25_aarch64.whl", hash = "sha256:796bd679890ee55fb14a94629b698b6db54bcfd833d391d5e94017dd9d7d3151", size = 10310827, upload-time = "2025-09-04T08:26:42.012Z" },
     { url = "https://files.pythonhosted.org/packages/33/6d/737d164b4837a9bbd202f5ae3078975f0525a55730fe871d8ed4e3b952b0/nvidia_cuda_cupti-13.0.85-py3-none-manylinux_2_25_x86_64.whl", hash = "sha256:4eb01c08e859bf924d222250d2e8f8b8ff6d3db4721288cf35d14252a4d933c8", size = 10715597, upload-time = "2025-09-04T08:26:51.312Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/df/b74b10025c1205695c5676373f2edd3e87a7202cc62ead0dfbc373b0f6ea/nvidia_cuda_cupti-13.0.85-py3-none-win_amd64.whl", hash = "sha256:683f58d301548deeefcb8f6fac1b8d907691b9d8b18eccab417f51e362102f00", size = 7736776, upload-time = "2025-09-04T08:38:08.38Z" },
 ]
 
 [[package]]
@@ -1662,12 +1679,13 @@ wheels = [
 
 [[package]]
 name = "sol-execbench"
-version = "1.0.1"
+version = "1.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "click" },
     { name = "cuda-tile" },
+    { name = "cupti-python" },
     { name = "datasets" },
     { name = "ninja" },
     { name = "nvidia-cudnn-frontend" },
@@ -1693,6 +1711,7 @@ requires-dist = [
     { name = "apache-tvm-ffi", specifier = ">=0.1.9" },
     { name = "click", specifier = ">=8.0" },
     { name = "cuda-tile", specifier = "==1.1.0" },
+    { name = "cupti-python", specifier = ">=13.0.1" },
     { name = "datasets", specifier = ">=4.8.2" },
     { name = "ninja", specifier = ">=1.13.0" },
     { name = "nvidia-cudnn-frontend", specifier = "==1.18.0" },

@@ -118,7 +118,6 @@ from sol_execbench.core.bench.correctness import (  # noqa: E402
     set_seed,
 )
 from sol_execbench.core.bench.io import (  # noqa: E402
-    ShiftingMemoryPoolAllocator,
     allocate_outputs,
     gen_inputs,
     load_safetensors,
@@ -132,7 +131,7 @@ from sol_execbench.core.bench.reward_hack import (  # noqa: E402
     check_thread_injection,
     snapshot_critical_functions,
 )
-from sol_execbench.core.bench.timing import clone_args, time_runnable  # noqa: E402
+from sol_execbench.core.bench.timing import time_runnable  # noqa: E402
 from sol_execbench.core.bench.utils import (  # noqa: E402
     make_eval,
 )
@@ -196,7 +195,6 @@ _CRITICAL_NAMES = [
     "_call_and_collect_outputs",
     "gen_inputs",
     "allocate_outputs",
-    "ShiftingMemoryPoolAllocator",
     "normalize_outputs",
     "make_eval",
 ]
@@ -374,17 +372,14 @@ if bench_config.lock_clocks and not _clocks_locked:
     sys.exit(0)
 
 set_seed(bench_config.seed)
-_allocator = None
 _inputs = None
 _ref_outputs = None
 _user_outputs = None
 _timing_outputs = None
 for _workload in workloads:
-    # Free GPU memory held by previous workload's tensors and allocator pools.
-    # The ShiftingMemoryPoolAllocator holds source views that keep old tensors
-    # alive, and PyTorch's CUDA caching allocator retains freed blocks.
+    # Free GPU memory held by previous workload's tensors.
+    # PyTorch's CUDA caching allocator retains freed blocks.
     # Without this cleanup, memory accumulates across workloads causing OOM.
-    _allocator = None
     _inputs = None
     _ref_outputs = None
     _user_outputs = None
@@ -587,39 +582,14 @@ for _workload in workloads:
         continue
 
     # -- User latency measurement --
-    # Use ShiftingMemoryPoolAllocator to provide unique data_ptr values each
-    # iteration without regenerating inputs. Outputs are zero-filled per call
-    # for DPS kernels. This prevents cheating kernels caching based on data_ptr().
-    # Allocating new inputs every iteration takes longer and cannibalizes VRAM
-    # required for computation.
     try:
-        _total_timing_iters = bench_config.warmup_runs + bench_config.iterations
         _timing_outputs = (
             allocate_outputs(definition, _resolved_axes, _device) if _dps else []
         )
-        _allocator = ShiftingMemoryPoolAllocator(
-            _inputs, _timing_outputs, _total_timing_iters
-        )
-    except torch.cuda.OutOfMemoryError as _e:
-        _emit(
-            Trace(
-                definition=definition.name,
-                solution=_solution_name,
-                workload=_workload,
-                evaluation=_make_eval(
-                    EvaluationStatus.RUNTIME_ERROR,
-                    _device,
-                    None,
-                    extra_msg=f"Out of memory: {_e}",
-                ),
-            )
-        )
-        continue
-
-    try:
         _sol_latency_ms = time_runnable(
             user_fn,
-            _allocator.get_unique_args,
+            _inputs,
+            _timing_outputs,
             _device,
             warmup=bench_config.warmup_runs,
             rep=bench_config.iterations,
@@ -648,16 +618,19 @@ for _workload in workloads:
 
     # -- Reference latency (for speedup factor) —always return-value style --
     # Inputs are cloned (not regenerated) since the reference cannot cheat.
-    try:
-        _ref_latency_ms = time_runnable(
-            ref_fn,
-            lambda: clone_args(_inputs),
-            _device,
-            warmup=bench_config.warmup_runs,
-            rep=bench_config.iterations,
-        )
-    except Exception:
-        _ref_latency_ms = 0.0
+    _ref_latency_ms = 0.0
+    if bench_config.benchmark_reference:
+        try:
+            _ref_latency_ms = time_runnable(
+                ref_fn,
+                _inputs,
+                [],
+                _device,
+                warmup=bench_config.warmup_runs,
+                rep=bench_config.iterations,
+            )
+        except Exception:
+            pass
 
     _speedup = _ref_latency_ms / _sol_latency_ms if _sol_latency_ms > 0 else 0.0
 

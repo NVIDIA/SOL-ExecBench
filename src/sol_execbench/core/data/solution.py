@@ -16,7 +16,6 @@
 """Strong-typed data definitions for solution implementations."""
 
 import hashlib
-import re
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -113,51 +112,6 @@ class SourceFile(BaseModelWithDocstrings):
             )
         return self
 
-    @model_validator(mode="after")
-    def _validate_no_stream_keyword(self) -> "SourceFile":
-        """Reject source files that contain forbidden stream usage.
-
-        CUDA stream manipulation can be used to game benchmark timing
-        (stream injection reward hack). Disallow it at the schema level.
-
-        - Python files: any occurrence of the word 'stream' is forbidden.
-        - C++/CUDA files: only ``getCurrentCUDAStream`` is allowed; any other
-          occurrence of 'stream' (e.g. ``cudaStreamCreate``, ``cudaStream_t``)
-          is rejected.
-
-        Raises
-        ------
-        ValueError
-            If the source content contains forbidden stream usage.
-        """
-        suffix = Path(self.path).suffix
-        if suffix == ".py":
-            if re.search(r"\bstream\b", self.content, re.IGNORECASE):
-                raise ValueError(
-                    f"Source file '{self.path}' contains the forbidden keyword 'stream'. "
-                    "CUDA stream usage is not permitted in Python solutions."
-                )
-        elif suffix in (".cu", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".cuh"):
-            # Allow getCurrentCUDAStream (returns the default stream the
-            # benchmark already runs on).  Block APIs that create or
-            # switch streams — these enable stream-injection timing attacks.
-            _FORBIDDEN_STREAM_APIS = re.compile(
-                r"cudaStreamCreate|cudaStreamCreateWithFlags"
-                r"|cudaStreamCreateWithPriority|cudaStreamSynchronize"
-                r"|cudaStreamWaitEvent|cudaStreamDestroy"
-                r"|cuStreamCreate|CUstream"
-                r"|c10::cuda::CUDAStream"
-                r"|at::cuda::getStreamFromPool",
-                re.IGNORECASE,
-            )
-            match = _FORBIDDEN_STREAM_APIS.search(self.content)
-            if match:
-                raise ValueError(
-                    f"Source file '{self.path}' contains forbidden stream API "
-                    f"'{match.group()}'. Only getCurrentCUDAStream() is permitted "
-                    "in C++/CUDA solutions."
-                )
-        return self
 
 
 class CompileOptions(BaseModelWithDocstrings):

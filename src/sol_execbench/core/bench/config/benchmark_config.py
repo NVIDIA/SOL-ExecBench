@@ -30,6 +30,7 @@ class BenchmarkConfig:
     warmup_runs: int = field(default=10)
     iterations: int = field(default=50)
     lock_clocks: bool = field(default=False)
+    benchmark_reference: bool = field(default=True)
     seed: int = field(default=200)
 
     def __post_init__(self):
