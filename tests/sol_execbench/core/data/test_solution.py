@@ -45,11 +45,13 @@ class TestLanguageMixingValidation:
         [
             ["pytorch"],
             ["triton"],
+            ["tlx"],
             ["cute_dsl"],
             ["cutile"],
             ["cudnn_frontend"],
             ["pytorch", "triton"],
-            ["pytorch", "triton", "cute_dsl", "cutile", "cudnn_frontend"],
+            ["pytorch", "triton", "tlx"],
+            ["pytorch", "triton", "tlx", "cute_dsl", "cutile", "cudnn_frontend"],
         ],
     )
     def test_pure_python_languages_accepted(self, langs):
@@ -80,6 +82,7 @@ class TestLanguageMixingValidation:
         [
             ["pytorch", "cuda_cpp"],
             ["triton", "cutlass"],
+            ["tlx", "cuda_cpp"],
             ["cute_dsl", "cudnn"],
             ["cutile", "cublas"],
             ["cudnn_frontend", "cuda_cpp"],
@@ -109,14 +112,14 @@ class TestEntryPointSuffixValidation:
     # -- Python languages with wrong suffix --
 
     @pytest.mark.parametrize(
-        "lang", ["pytorch", "triton", "cute_dsl", "cutile", "cudnn_frontend"]
+        "lang", ["pytorch", "triton", "tlx", "cute_dsl", "cutile", "cudnn_frontend"]
     )
     def test_python_language_rejects_cu_entry(self, lang):
         with pytest.raises(ValidationError, match="require a .py entry point"):
             _make_spec(languages=[lang], entry_point="kernel.cu::run")
 
     @pytest.mark.parametrize(
-        "lang", ["pytorch", "triton", "cute_dsl", "cutile", "cudnn_frontend"]
+        "lang", ["pytorch", "triton", "tlx", "cute_dsl", "cutile", "cudnn_frontend"]
     )
     def test_python_language_rejects_cpp_entry(self, lang):
         with pytest.raises(ValidationError, match="require a .py entry point"):
@@ -141,7 +144,7 @@ class TestEntryPointSuffixValidation:
     # -- Python languages with valid suffix --
 
     @pytest.mark.parametrize(
-        "lang", ["pytorch", "triton", "cute_dsl", "cutile", "cudnn_frontend"]
+        "lang", ["pytorch", "triton", "tlx", "cute_dsl", "cutile", "cudnn_frontend"]
     )
     def test_python_language_accepts_py_entry(self, lang):
         spec = _make_spec(languages=[lang], entry_point="kernel.py::run")

@@ -37,6 +37,8 @@ class SupportedLanguages(str, Enum):
     """PyTorch programming language. Specified if the solution uses PyTorch operators."""
     TRITON = "triton"
     """Triton GPU programming language."""
+    TLX = "tlx"
+    """Triton Low-Level Extensions (fbtriton/tlx) programming language."""
     CUTE_DSL = "cute_dsl"
     """NVIDIA CuTe DSL programming language."""
     CUTILE = "cutile"
@@ -184,6 +186,7 @@ class BuildSpec(BaseModelWithDocstrings):
         python_languages = [
             SupportedLanguages.PYTORCH,
             SupportedLanguages.TRITON,
+            SupportedLanguages.TLX,
             SupportedLanguages.CUTE_DSL,
             SupportedLanguages.CUTILE,
             SupportedLanguages.CUDNN_FRONTEND,

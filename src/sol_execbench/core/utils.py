@@ -52,6 +52,13 @@ def env_snapshot(device: str) -> "Environment":
         pass
 
     try:
+        from triton.language.extra import tlx as _tlx
+
+        libs["tlx"] = getattr(_tlx, "__version__", libs.get("triton", "unknown"))
+    except Exception:
+        pass
+
+    try:
         import torch.version as tv
 
         if getattr(tv, "cuda", None):
