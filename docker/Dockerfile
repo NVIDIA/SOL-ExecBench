@@ -32,7 +32,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /usr/local/bin/uv
 # sudo: allows eval driver to call nvidia-smi for GPU clock locking
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y ccache cmake ninja-build sudo
+    apt-get update && apt-get install -y ccache cmake ninja-build sudo python3-pip
 
 # Create user and setup directories
 # Note: Host GID may already exist in base image, so we use -f (force) flag
@@ -43,6 +43,8 @@ RUN if [ "${HOST_UID}" != "0" ]; then \
     fi && \
     mkdir -p /sol-execbench && mkdir -p /venv && \
     chown -R ${HOST_UID}:${HOST_GID} /sol-execbench /venv && \
+    mkdir -p /opt/wheelhouse && \
+    chown -R ${HOST_UID}:${HOST_GID} /opt/wheelhouse && \
     echo "${HOST_USER} ALL=(ALL) NOPASSWD: /usr/bin/nvidia-smi" >> /etc/sudoers
 
 # Copy and set up entrypoint while still root (avoid switching back)
@@ -81,5 +83,16 @@ RUN --mount=type=cache,target=/home/${HOST_USER}/.cache/uv,uid=${HOST_UID},gid=$
 # PYTHONPATH lets the volume-mounted src/ override the installed package at runtime.
 ENV PATH="/venv/bin:${PATH}" \
     PYTHONPATH="/sol-execbench/src"
+
+# Offline wheelhouse for solution pip_packages (installed per-submission at eval).
+# Download the maintainer allowlist of published wheels; adding a line is the gate.
+# /usr/bin/python3: the uv venv (first on PATH) has no pip.
+COPY docker/wheelhouse-allowlist.txt /tmp/wheelhouse-allowlist.txt
+RUN if [ "$(grep -cvE '^[[:space:]]*(#.*)?$' /tmp/wheelhouse-allowlist.txt)" -gt 0 ]; then \
+        /usr/bin/python3 -m pip download -r /tmp/wheelhouse-allowlist.txt \
+            --no-deps --only-binary=:all: -d /opt/wheelhouse; \
+    fi
+
+ENV UV_FIND_LINKS="/opt/wheelhouse"
 
 ENTRYPOINT ["/entrypoint.sh"]

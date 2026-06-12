@@ -1,0 +1,38 @@
+{
+  "name": "softmax_tlx_h4096",
+  "op_type": "softmax",
+  "axes": {
+    "num_rows": {
+      "type": "var",
+      "description": null
+    },
+    "num_cols": {
+      "type": "const",
+      "value": 4096,
+      "description": null
+    }
+  },
+  "custom_inputs_entrypoint": null,
+  "inputs": {
+    "x": {
+      "shape": [
+        "num_rows",
+        "num_cols"
+      ],
+      "dtype": "bfloat16",
+      "description": null
+    }
+  },
+  "outputs": {
+    "y": {
+      "shape": [
+        "num_rows",
+        "num_cols"
+      ],
+      "dtype": "bfloat16",
+      "description": null
+    }
+  },
+  "reference": "import torch\n\n\n@torch.no_grad()\ndef run(x):\n    # Row-wise softmax over the last dimension. Computed in fp32 for numerical\n    # stability, then cast back to the input dtype.\n    return torch.softmax(x.to(torch.float32), dim=-1).to(x.dtype)\n",
+  "description": "Row-wise softmax over the last dim (num_cols=4096). Reference is torch.softmax in fp32; the TLX solution requires Meta's fbtriton fork."
+}

@@ -297,6 +297,66 @@ def cli(
     if verbose:
         console.print(f"[dim]Staging dir: {staging_dir}[/dim]")
 
+    # Phase 0: install pip_packages into an isolated dir, prepended to PYTHONPATH.
+    install = packager.install_deps()
+    if install is not None:
+        install_cmd, deps_target = install
+
+        # Allowlist check: in wheelhouse mode, a package is allowed only if a wheel
+        # for it is present in the wheelhouse. Reject up front with a clear message.
+        disallowed, available = packager.check_pip_packages_allowed()
+        if disallowed:
+            console.print(
+                "[red]Disallowed pip_packages (not in the wheelhouse allowlist):[/red]"
+            )
+            for pkg in disallowed:
+                console.print(f"  - {pkg}")
+            if available:
+                console.print("[dim]Available wheels:[/dim]")
+                for whl in available:
+                    console.print(f"  {whl}")
+            else:
+                console.print("[dim](wheelhouse is empty)[/dim]")
+            sys.exit(1)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                f"Installing {len(solution.spec.pip_packages)} pip package(s)...",
+                total=None,
+            )
+            proc = subprocess.run(
+                install_cmd,
+                cwd=staging_dir,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env={**os.environ, "PYTORCH_ALLOC_CONF": "expandable_segments:True"},
+            )
+            progress.update(task, completed=True)
+
+        if proc.returncode != 0:
+            console.print("[red]Dependency install failed[/red]")
+            if proc.stderr:
+                console.print(proc.stderr)
+            if proc.stdout:
+                console.print(proc.stdout)
+            sys.exit(1)
+
+        # Prepend the install target to PYTHONPATH so the compile/eval subprocesses
+        # (which spread os.environ) can import the installed packages.
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            p for p in (deps_target, os.environ.get("PYTHONPATH", "")) if p
+        )
+        console.print(
+            f"[green]Installed {len(solution.spec.pip_packages)} pip package(s)[/green]"
+        )
+        if verbose:
+            console.print(f"[dim]pip target: {deps_target}[/dim]")
+
     # Phase 1: Compile (C++/CUDA only)
     if packager._is_cpp:
         with Progress(

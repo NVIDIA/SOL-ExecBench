@@ -113,7 +113,6 @@ class SourceFile(BaseModelWithDocstrings):
         return self
 
 
-
 class CompileOptions(BaseModelWithDocstrings):
     """Compiler and linker flags for C++/CUDA solutions.
 
@@ -145,6 +144,10 @@ class BuildSpec(BaseModelWithDocstrings):
     dependencies: list[NonEmptyString] = Field(default_factory=list)
     """Optional list of required libraries or packages. E.g. for CUDA, we support 'cublas',
     'cudnn', 'cutlass'"""
+    pip_packages: list[NonEmptyString] = Field(default_factory=list)
+    """Optional extra Python packages to install before evaluation, each a pip
+    requirement string (e.g. 'fbtriton==3.6.0'). Installed into an isolated dir
+    prepended to PYTHONPATH, so they add to or shadow the base environment."""
     destination_passing_style: bool = True
     """Whether to use destination passing style for the solution. If True, the solution should
     accept the output tensors as the last arguments. If False, the solution should return the
@@ -337,6 +340,7 @@ class Solution(BaseModelWithDocstrings):
             self.spec.entry_point,
             self.spec.binding.value if self.spec.binding else "",
             *self.spec.dependencies,
+            *self.spec.pip_packages,
             *(part for src in self.sources for part in (src.path, src.content)),
         ):
             h.update(s.encode())

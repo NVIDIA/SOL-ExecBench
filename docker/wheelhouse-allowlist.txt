@@ -1,0 +1,6 @@
+# Allowlist of extra PyPI packages a submission may install via spec.pip_packages.
+# One pinned pip requirement per line; wheels are downloaded into /opt/wheelhouse
+# at build time and installed offline, per submission, at eval. Adding a line here
+# is the approval gate (maintainer-reviewed change).
+
+fbtriton==3.6.1

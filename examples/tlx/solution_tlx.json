@@ -1,0 +1,30 @@
+{
+  "name": "softmax_tlx",
+  "definition": "softmax_tlx_h4096",
+  "author": "example",
+  "description": "Softmax using TLX (Triton Low-level Extensions) from Meta's fbtriton fork, brought in via pip_packages.",
+  "spec": {
+    "languages": [
+      "triton"
+    ],
+    "target_hardware": [
+      "B200",
+      "LOCAL"
+    ],
+    "entry_point": "kernel.py::run",
+    "dependencies": [
+      "torch"
+    ],
+    "pip_packages": [
+      "fbtriton"
+    ],
+    "destination_passing_style": false,
+    "binding": null
+  },
+  "sources": [
+    {
+      "path": "kernel.py",
+      "content": "# TLX (Triton Low-level Extensions) softmax.\n#\n# This kernel imports `triton.language.extra.tlx`, which exists only in Meta's\n# **fbtriton** fork, not upstream triton. The solution therefore declares\n# `fbtriton` in `spec.pip_packages`; SOL-ExecBench installs it before evaluation\n# (offline, from the curated wheelhouse) into an isolated dir prepended to\n# PYTHONPATH, so `import triton` here resolves to the fork that provides TLX.\n#\n# Pattern: the canonical single-tile async-load softmax \u2014 copy each row into\n# shared memory with cp.async (`tlx.async_load`), then reduce in registers.\nimport torch\nimport triton\nimport triton.language as tl\nimport triton.language.extra.tlx as tlx\n\n\n@triton.jit\ndef _softmax_tlx_kernel(\n    output_ptr,\n    input_ptr,\n    input_row_stride,\n    output_row_stride,\n    n_rows,\n    n_cols,\n    BLOCK_SIZE: tl.constexpr,\n    num_stages: tl.constexpr,\n):\n    # Persistent grid: each CTA strides over multiple rows.\n    row_start = tl.program_id(0)\n    row_step = tl.num_programs(0)\n\n    # Hoist the SMEM buffer outside the loop (required by TLX scoping rules).\n    row_smem = tlx.local_alloc((BLOCK_SIZE,), input_ptr.dtype.element_ty, 1)\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    for row_idx in tl.range(row_start, n_rows, row_step, num_stages=num_stages):\n        input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets\n\n        # Async-copy the row into shared memory, commit the group, then wait.\n        row_buf = tlx.local_view(row_smem, 0)\n        token = tlx.async_load(input_ptrs, row_buf, mask=mask, other=-float(\"inf\"))\n        tlx.async_load_commit_group([token])\n        tlx.async_load_wait_group(0)\n\n        # Pull into registers and do the row-wise softmax in fp32.\n        row = tlx.local_load(row_buf).to(tl.float32)\n        row = tl.where(mask, row, -float(\"inf\"))\n        row = row - tl.max(row, axis=0)\n        numerator = tl.exp(row)\n        out = numerator / tl.sum(numerator, axis=0)\n\n        output_ptrs = output_ptr + row_idx * output_row_stride + col_offsets\n        tl.store(output_ptrs, out.to(output_ptr.dtype.element_ty), mask=mask)\n\n\ndef run(x):\n    \"\"\"Return-value style: row-wise softmax using the TLX kernel.\"\"\"\n    n_rows, n_cols = x.shape\n    y = torch.empty_like(x)\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n    num_sm = torch.cuda.get_device_properties(x.device).multi_processor_count\n    grid = (min(num_sm, n_rows), 1, 1)\n    _softmax_tlx_kernel[grid](\n        y,\n        x,\n        x.stride(0),\n        y.stride(0),\n        n_rows,\n        n_cols,\n        BLOCK_SIZE=BLOCK_SIZE,\n        num_stages=2,\n        num_warps=8,\n    )\n    return y\n"
+    }
+  ]
+}

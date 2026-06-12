@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from ..core import (
@@ -75,6 +78,17 @@ def _sm_to_gencode(sm: str) -> str:
     """Convert an SM version string (e.g. 'sm_90', 'sm_100a') to a gencode flag."""
     arch = sm.removeprefix("sm_")
     return f"-gencode=arch=compute_{arch},code={sm}"
+
+
+def _canonical_name(name: str) -> str:
+    """PEP 503 normalized distribution name (lowercase, runs of -_. -> -)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _requirement_name(req: str) -> str:
+    """Extract the canonical distribution name from a pip requirement string."""
+    m = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", req)
+    return _canonical_name(m.group(1)) if m else ""
 
 
 class ProblemPackager:
@@ -159,6 +173,57 @@ class ProblemPackager:
             dest = self.output_dir / src.path
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(src.content)
+
+    def install_deps(self) -> tuple[list[str], str] | None:
+        """Return (command, target_dir) to install pip_packages, or None if empty.
+
+        Installs into an isolated target_dir the CLI prepends to PYTHONPATH. With
+        ``UV_FIND_LINKS`` set, locks the install to that offline wheelhouse
+        (``--no-index --offline --no-deps``); otherwise resolves from the index.
+        """
+        pkgs = self.solution.spec.pip_packages
+        if not pkgs:
+            return None
+        target = self.output_dir / "_pip_deps"
+        cmd = [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--target",
+            str(target),
+        ]
+        wheelhouse = os.environ.get("UV_FIND_LINKS")
+        if wheelhouse:
+            cmd += [
+                "--no-index",
+                "--find-links",
+                wheelhouse,
+                "--offline",
+                "--no-deps",
+            ]
+        cmd += list(pkgs)
+        return cmd, str(target)
+
+    def check_pip_packages_allowed(self) -> tuple[list[str], list[str]]:
+        """Return (disallowed_requirements, available_wheels) for the wheelhouse.
+
+        In wheelhouse mode (``UV_FIND_LINKS`` set) a pip_packages entry is allowed
+        only if a wheel for its distribution is present in the wheelhouse — that dir
+        is the curated allowlist. Returns the disallowed entries plus the available
+        wheel filenames (for a clear error). Outside wheelhouse mode returns
+        ([], []): there is no allowlist to enforce (index resolution, dev only).
+        """
+        wheelhouse = os.environ.get("UV_FIND_LINKS")
+        pkgs = self.solution.spec.pip_packages
+        if not wheelhouse or not pkgs:
+            return [], []
+        wh = Path(wheelhouse)
+        available = sorted(p.name for p in wh.glob("*.whl")) if wh.is_dir() else []
+        allowed = {_canonical_name(f.split("-", 1)[0]) for f in available}
+        disallowed = [p for p in pkgs if _requirement_name(p) not in allowed]
+        return disallowed, available
 
     def compile(self) -> tuple[list[str], str]:
         """Stage compilation files and return (command, artifact_path).
