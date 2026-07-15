@@ -93,6 +93,10 @@ Pass `--config bench.json` to override evaluator defaults. All fields are option
 | `benchmark_reference` | bool | `false` | When `true`, also time the reference implementation to compute speedup. **Disabled by default** because the reference can be dramatically slower than the kernel (sometimes >1 h), which dominates total evaluation time. Enable when you need a speedup factor in the trace. |
 | `seed` | int | `200` | RNG seed for input generation |
 
+### Evaluation Environment
+
+Official evaluations run on NVIDIA B200 GPUs with SM clocks locked at 1500 MHz. CPU hardware and CPU-side load may vary between evaluation workers, so approximately 5% run-to-run latency variance is expected. Submissions that launch many small kernels are more sensitive to CPU launch and scheduling overhead and may see up to 10% variance.
+
 A template with every field at its default value lives at [`bench_config.example.json`](bench_config.example.json) — copy it, edit the fields you want to override, and pass it via `--config`:
 
 ```bash

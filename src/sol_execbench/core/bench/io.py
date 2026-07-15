@@ -18,10 +18,12 @@
 from __future__ import annotations
 
 import math
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+from torch.utils import dlpack
 
 from sol_execbench.core.data import (
     Definition,
@@ -65,6 +67,44 @@ def _cast_to_fp4x2(x: torch.Tensor) -> torch.Tensor:
     # Pack two FP4 values into one byte along cols dimension
     packed = result[..., ::2] + result[..., 1::2] * 16
     return packed.view(torch.float4_e2m1fn_x2)
+
+
+def _storage_span_from_first_element(tensor: torch.Tensor) -> int:
+    """Return physical storage elements reachable from the logical first element."""
+    if tensor.numel() == 0:
+        return 0
+
+    span = 1
+    for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+        if stride < 0:
+            raise ValueError("negative tensor strides are not supported")
+        if size > 1:
+            span += (size - 1) * stride
+    return span
+
+
+def _rebase_tensor_storage(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a tensor whose visible storage starts at ``tensor.data_ptr()``."""
+    try:
+        return dlpack.from_dlpack(tensor)
+    except (BufferError, RuntimeError) as error:
+        if "not supported by dlpack" not in str(error):
+            raise
+
+    # Older PyTorch builds reject FP8/FP4 tensors during DLPack export. Rebase
+    # the same device pointer through a non-owning storage in that case.
+    storage_span = _storage_span_from_first_element(tensor)
+    storage = torch._C._construct_storage_from_data_pointer(
+        tensor.data_ptr(),
+        tensor.device,
+        storage_span * tensor.element_size(),
+    )
+    return torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
+        storage,
+        0,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+    )
 
 
 def _rand_tensor(
@@ -520,10 +560,14 @@ class ShiftingMemoryPoolAllocator:
     """Pre-allocated memory pool that provides unique ``data_ptr`` per iteration.
 
     Allocates a buffer only slightly larger than the input tensors
-    (overhead ≈ ``total_iterations × 256`` bytes per tensor).  The source
+    (overhead ≈ ``total_iterations × 2048`` bytes per tensor).  The source
     data is retained and copied into an advancing offset of the pool on
     each call to :meth:`get_unique_args`, so every iteration sees a
     distinct ``data_ptr`` while VRAM usage stays near 1× input size.
+
+    The advance is a seeded random multiple of ``_POOL_ALIGNMENT``. This
+    removes the fixed-stride signal that a submission could use to detect the
+    timing loop while keeping runs reproducible.
 
     Stride patterns (including stride-0 broadcasts from ``expand()``) are
     preserved so that the pool only stores the physical storage footprint,
@@ -542,31 +586,47 @@ class ShiftingMemoryPoolAllocator:
     total_iterations : int
         Total number of :meth:`get_unique_args` calls expected
         (warmup + timed iterations).
+    seed : int
+        Seed for the per-iteration shift sequence.
     """
 
-    # Tensor alignment in bytes – shift data_ptr by this much each iteration
+    # Tensor alignment in bytes – shift by a random multiple each iteration.
     _POOL_ALIGNMENT = 256
+    _MAX_SHIFT_BYTES = 2048
 
     def __init__(
         self,
         inputs: List[Any],
         outputs: List[torch.Tensor],
         total_iterations: int,
+        seed: int = 0,
     ) -> None:
         self._call_idx = 0
         self._total_iterations = total_iterations
         self._input_entries: List[Dict[str, Any]] = []
         self._output_entries: List[Dict[str, Any]] = []
+        self._live_rebased_tensors: List[torch.Tensor] = []
+        self._offset_blocks = self._compute_offset_blocks(total_iterations, seed)
 
         for inp in inputs:
             if not isinstance(inp, torch.Tensor):
                 self._input_entries.append({"scalar": inp})
                 continue
 
-            self._input_entries.append(self._make_pool_entry(inp, total_iterations))
+            self._input_entries.append(self._make_pool_entry(inp))
 
         for out in outputs:
-            self._output_entries.append(self._make_pool_entry(out, total_iterations))
+            self._output_entries.append(self._make_pool_entry(out))
+
+    @classmethod
+    def _compute_offset_blocks(cls, total_iterations: int, seed: int) -> List[int]:
+        """Return reproducible cumulative alignment-block offsets."""
+        max_multiplier = cls._MAX_SHIFT_BYTES // cls._POOL_ALIGNMENT
+        rng = random.Random(seed)
+        offsets = [0]
+        for _ in range(max(0, total_iterations - 1)):
+            offsets.append(offsets[-1] + rng.randint(1, max_multiplier))
+        return offsets
 
     @staticmethod
     def _storage_span(tensor: torch.Tensor) -> int:
@@ -584,10 +644,7 @@ class ShiftingMemoryPoolAllocator:
                 span += (s - 1) * st
         return span
 
-    @classmethod
-    def _make_pool_entry(
-        cls, tensor: torch.Tensor, total_iterations: int
-    ) -> Dict[str, Any]:
+    def _make_pool_entry(self, tensor: torch.Tensor) -> Dict[str, Any]:
         # Negative strides (e.g. from flip()) make storage span math
         # ambiguous — materialise to contiguous up front.
         if any(st < 0 for st in tensor.stride()):
@@ -595,14 +652,12 @@ class ShiftingMemoryPoolAllocator:
 
         shape = tuple(tensor.shape)
         strides = tensor.stride()
-        storage_span = cls._storage_span(tensor)
+        storage_span = self._storage_span(tensor)
         elem_size = tensor.element_size()
 
-        # Shift data_ptr by _POOL_ALIGNMENT bytes each iteration.
-        stride_numel = max(1, cls._POOL_ALIGNMENT // elem_size)
+        block_numel = max(1, self._POOL_ALIGNMENT // elem_size)
 
-        # Pool only needs storage_span + (iters-1)*stride extra elements.
-        pool_numel = storage_span + (total_iterations - 1) * stride_numel
+        pool_numel = storage_span + self._offset_blocks[-1] * block_numel
         pool = torch.empty(pool_numel, dtype=tensor.dtype, device=tensor.device)
 
         # Flat 1D view of the physical storage this tensor spans.
@@ -614,7 +669,7 @@ class ShiftingMemoryPoolAllocator:
             "shape": shape,
             "strides": strides,
             "storage_span": storage_span,
-            "stride_numel": stride_numel,
+            "block_numel": block_numel,
         }
 
     def get_unique_args(self) -> List[Any]:
@@ -633,24 +688,29 @@ class ShiftingMemoryPoolAllocator:
 
         result: List[Any] = []
         idx = self._call_idx
+        block_offset = self._offset_blocks[idx]
 
         for entry in self._input_entries:
             if "scalar" in entry:
                 result.append(entry["scalar"])
                 continue
 
-            start = idx * entry["stride_numel"]
+            start = block_offset * entry["block_numel"]
             entry["pool"].narrow(0, start, entry["storage_span"]).copy_(entry["source"])
-            result.append(
+            shifted = _rebase_tensor_storage(
                 entry["pool"].as_strided(entry["shape"], entry["strides"], start)
             )
+            self._live_rebased_tensors.append(shifted)
+            result.append(shifted)
 
         for entry in self._output_entries:
-            start = idx * entry["stride_numel"]
+            start = block_offset * entry["block_numel"]
             entry["pool"].narrow(0, start, entry["storage_span"]).zero_()
-            result.append(
+            shifted = _rebase_tensor_storage(
                 entry["pool"].as_strided(entry["shape"], entry["strides"], start)
             )
+            self._live_rebased_tensors.append(shifted)
+            result.append(shifted)
 
         self._call_idx += 1
         return result

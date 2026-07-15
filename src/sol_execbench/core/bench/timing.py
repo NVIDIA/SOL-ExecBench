@@ -16,18 +16,29 @@
 from __future__ import annotations
 
 import bisect
-import ctypes
-import ctypes.util
 import statistics
 from collections.abc import Callable
-from dataclasses import dataclass
-from functools import partial
 from typing import Any, Literal, Union
 
 import torch
+from cuda.bindings import runtime as cuda_runtime
 from cupti import cupti
 
+from sol_execbench.core.bench.cupti_utils import (
+    CuptiKernelInfo,
+    collect_cupti_activities,
+    kernel_activity_counts,
+    kernel_activity_sequence,
+    select_activity_sequence,
+)
 from sol_execbench.core.bench.io import ShiftingMemoryPoolAllocator
+
+
+GPU_TIMING_ACTIVITY_KINDS = (
+    cupti.ActivityKind.CONCURRENT_KERNEL,
+    cupti.ActivityKind.MEMCPY,
+    cupti.ActivityKind.MEMSET,
+)
 
 
 def get_l2_cache_size(device) -> int:
@@ -70,6 +81,25 @@ def _clear_cache(cache: torch.Tensor) -> None:
     cache.zero_()
 
 
+def _reset_persisting_l2_cache(
+    device: int | str | torch.device | None = None,
+) -> None:
+    """Reset persisting L2 cache lines to normal status."""
+
+    def reset_current_device() -> None:
+        result = cuda_runtime.cudaCtxResetPersistingL2Cache()
+        if isinstance(result, tuple):
+            result = result[0]
+        torch.cuda.check_error(int(result))
+
+    if device is not None:
+        with torch.cuda.device(device):
+            reset_current_device()
+        return
+
+    reset_current_device()
+
+
 def clone_args(args: list[Any]) -> list[Any]:
     """Clone tensor arguments to prevent cross-iteration data contamination.
 
@@ -77,81 +107,6 @@ def clone_args(args: list[Any]) -> list[Any]:
     starts with independent data.  Non-tensor arguments are passed through.
     """
     return [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
-
-
-_libstdcxx = ctypes.CDLL(ctypes.util.find_library("stdc++"))
-_libstdcxx.__cxa_demangle.argtypes = [
-    ctypes.c_char_p,
-    ctypes.c_char_p,
-    ctypes.POINTER(ctypes.c_size_t),
-    ctypes.POINTER(ctypes.c_int),
-]
-_libstdcxx.__cxa_demangle.restype = ctypes.c_char_p
-
-
-def _demangle(name: str) -> str:
-    status = ctypes.c_int()
-    result = _libstdcxx.__cxa_demangle(name.encode(), None, None, ctypes.byref(status))
-    if status.value != 0:
-        return name
-    return result.decode().replace(" >", ">")
-
-
-@dataclass(frozen=True)
-class CuptiKernelInfo:
-    name: str
-    start: float
-    end: float
-    correlation_id: int
-    copy_kind: int
-    bytes: int
-    value: int
-    kind: cupti.ActivityKind
-    _activity: Any
-
-    @classmethod
-    def from_activity(cls, activity):
-        return cls(
-            name=cls.set_kernel_name(activity),
-            start=activity.start,
-            end=activity.end,
-            correlation_id=activity.correlation_id,
-            copy_kind=cls.get_copy_kind(activity),
-            bytes=cls.get_bytes(activity),
-            value=cls.get_value(activity),
-            kind=activity.kind,
-            _activity=activity,
-        )
-
-    @staticmethod
-    def set_kernel_name(activity):
-        if activity.kind == cupti.ActivityKind.CONCURRENT_KERNEL:
-            return _demangle(activity.name)
-        elif activity.kind == cupti.ActivityKind.MEMCPY:
-            return "MEMCPY"
-        elif activity.kind == cupti.ActivityKind.MEMSET:
-            return "MEMSET"
-
-    @staticmethod
-    def get_bytes(activity):
-        if activity.kind in (cupti.ActivityKind.MEMCPY, cupti.ActivityKind.MEMSET):
-            return activity.bytes
-        else:
-            return 0
-
-    @staticmethod
-    def get_copy_kind(activity):
-        if activity.kind == cupti.ActivityKind.MEMCPY:
-            return activity.copy_kind
-        else:
-            return 0
-
-    @staticmethod
-    def get_value(activity):
-        if activity.kind == cupti.ActivityKind.MEMSET:
-            return activity.value
-        else:
-            return 0
 
 
 def bench_gpu_time_with_cupti(
@@ -162,82 +117,13 @@ def bench_gpu_time_with_cupti(
     cold_l2_cache: bool = True,
     device="cuda",
 ):
+    """Benchmark GPU time using the discovered user CUPTI activity sequence.
+
+    Setup and cache-management work is excluded by discovering the user-call
+    sequence after warmup, then selecting only that sequence from every timed
+    iteration. The end timestamp is captured after synchronization so delayed
+    or non-default-stream work remains inside the attribution window.
     """
-    Benchmark GPU time using CUPTI activity tracing for precise kernel timing.
-
-    CUPTI (CUDA Profiling Tools Interface) provides hardware-level profiling that
-    measures actual GPU kernel execution time, excluding CPU-side launch overhead.
-    This gives the most accurate kernel performance measurements.
-
-    Cold L2 cache is achieved via L2 flush between iterations. CUPTI measures
-    per-iteration, so L2 flush works correctly.
-
-    Behavior:
-    - Uses CUPTI (requires version >= 13, i.e., CUDA 13+) to trace kernel activities
-      and compute per-iteration GPU time from recorded start/end timestamps.
-
-    Args:
-        fn (Callable): The kernel function to benchmark.
-        warmup (int, optional): Number of warmup iterations (not timed).
-            If None, computed from dry_run_time_ms.
-        rep (int, optional): Number of measured iterations.
-        setup (Callable, optional): Called before each timed iteration; its return value is passed to *fn*.
-            Setup time is **not** included in measurements. This method should only enqueue operations onto the default stream and should not explcitly synchronize.
-        cold_l2_cache (bool): If True, flush L2 cache before each iteration to
-            ensure cold-cache performance measurements (default: True).
-
-    Returns:
-        List[float]: Per-iteration GPU kernel execution times in milliseconds.
-
-    Example:
-        Basic CUPTI benchmarking (requires cupti-python >= 13):
-
-        >>> def my_kernel(a, b):
-        ...     return torch.matmul(a, b.T)
-        >>> q = torch.randn(1024, 128, device="cuda")
-        >>> k = torch.randn(1024, 128, device="cuda")
-        >>> times = bench_gpu_time_with_cupti(
-        ...     fn=my_kernel,
-        ...     input_args=(q, k),
-        ... )
-        >>> print(f"Median GPU time: {np.median(times):.3f} ms")
-    """
-
-    # CUPTI buffer callbacks
-    def func_buffer_requested():
-        buffer_size = 8 * 1024 * 1024
-        max_num_records = 0
-        return buffer_size, max_num_records
-
-    def func_buffer_completed(
-        launches: list[tuple[float, float, int, int, int]],
-        kernels: list[CuptiKernelInfo],
-        activities: list,
-    ):
-        for activity in activities:
-            if activity.kind in (
-                cupti.ActivityKind.CONCURRENT_KERNEL,
-                cupti.ActivityKind.MEMCPY,
-                cupti.ActivityKind.MEMSET,
-            ):
-                # Kernel activity
-                kernels.append(CuptiKernelInfo.from_activity(activity))
-            elif activity.kind in (
-                cupti.ActivityKind.RUNTIME,
-                cupti.ActivityKind.DRIVER,
-            ):
-                # Runtime or Driver activity
-                launches.append(
-                    (
-                        activity.start,
-                        activity.end,
-                        activity.correlation_id,
-                        activity.cbid,
-                        activity.kind,
-                    )
-                )
-
-    # Check if args are provided (determines how we call fn)
     if setup is None:
         _fn = fn
 
@@ -255,95 +141,70 @@ def bench_gpu_time_with_cupti(
     runner: Callable = fn
     runner_args: Callable = setup
 
-    # Dry runs
+    def prepare_iteration(*, synchronize: bool = True):
+        args = runner_args()
+        if cold_l2_cache:
+            _reset_persisting_l2_cache(device)
+            _clear_cache(buffer)
+        if synchronize:
+            torch.cuda.synchronize()
+        return args
+
     torch.cuda.synchronize()
     for _ in range(warmup):
-        args = runner_args()
-        if cold_l2_cache:
-            _clear_cache(buffer)
+        args = prepare_iteration()
         runner(args)
     torch.cuda.synchronize()
 
-    # CUPTI measurement
-    launches: list[tuple[float, float, int, int, int]] = []
-    kernels: list[CuptiKernelInfo] = []
-    iter_timestamps = []
-    cupti.activity_enable(cupti.ActivityKind.RUNTIME)
-    cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
-    cupti.activity_enable(cupti.ActivityKind.DRIVER)
-    cupti.activity_enable(cupti.ActivityKind.MEMCPY)
-    cupti.activity_enable(cupti.ActivityKind.MEMSET)
-    cupti.activity_register_callbacks(
-        func_buffer_requested, partial(func_buffer_completed, launches, kernels)
-    )
-    torch.cuda.synchronize()
-    for _ in range(rep):
-        args = runner_args()
-        if cold_l2_cache:
-            _clear_cache(buffer)
-        start_cpu = cupti.get_timestamp()
+    # Discover the user-call GPU activity sequence after setup/cache work drains.
+    args = prepare_iteration()
+    with collect_cupti_activities(
+        activity_kinds=GPU_TIMING_ACTIVITY_KINDS
+    ) as discovery_buffers:
         runner(args)
-        end_cpu = cupti.get_timestamp()
-        # keep this synchronize here to ensure timestamps are consistent
         torch.cuda.synchronize()
-        iter_timestamps.append((start_cpu, end_cpu))
-    torch.cuda.synchronize()
-    cupti.activity_flush_all(0)
-    cupti.activity_disable(cupti.ActivityKind.RUNTIME)
-    cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
-    cupti.activity_disable(cupti.ActivityKind.DRIVER)
-    cupti.activity_disable(cupti.ActivityKind.MEMCPY)
-    cupti.activity_disable(cupti.ActivityKind.MEMSET)
-    cupti.finalize()
+    expected_kernels = sorted(
+        discovery_buffers.kernels,
+        key=lambda kernel: (kernel.start, kernel.end, kernel.correlation_id),
+    )
+    expected_kernel_names = kernel_activity_sequence(expected_kernels)
+    if not expected_kernel_names:
+        raise ValueError("No kernel activities recorded during discovery iteration")
+    expected_kernel_counts = kernel_activity_counts(expected_kernels)
 
-    def generate_kernel_string(kernel: CuptiKernelInfo):
-        # No start, end, correlation_id is considered in the kernel string
-        return f"{kernel.name}_{kernel.copy_kind}_{kernel.bytes}_{kernel.value}_{kernel.kind}"
+    iter_timestamps = []
+    with collect_cupti_activities(
+        activity_kinds=GPU_TIMING_ACTIVITY_KINDS
+    ) as cupti_buffers:
+        torch.cuda.synchronize()
+        for _ in range(rep):
+            args = prepare_iteration(synchronize=False)
+            start_cpu = cupti.get_timestamp()
+            runner(args)
+            torch.cuda.synchronize()
+            end_cpu = cupti.get_timestamp()
+            iter_timestamps.append((start_cpu, end_cpu))
+        torch.cuda.synchronize()
 
-    # Process activities - OPTIMIZED O(N + M log M) algorithm
-    # Step 1: Sort launches by start timestamp - O(M log M)
-    sorted_launches = sorted(launches, key=lambda la: la[0])
-    launch_starts = [la[0] for la in sorted_launches]
-
-    # Step 2: Build correlation_id -> kernels mapping - O(K)
-    corr_id_to_kernels: dict[int, list[CuptiKernelInfo]] = {}
-    for k in kernels:
-        corr_id = k.correlation_id
-        if corr_id not in corr_id_to_kernels:
-            corr_id_to_kernels[corr_id] = []
-        corr_id_to_kernels[corr_id].append(k)
-
+    sorted_kernels = sorted(
+        cupti_buffers.kernels,
+        key=lambda kernel: (kernel.start, kernel.end, kernel.correlation_id),
+    )
+    kernel_starts = [kernel.start for kernel in sorted_kernels]
     measured_times = []
-    kernel_names = None
     for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
-        # Use binary search to find launches within time range - O(log M)
-        left_idx = bisect.bisect_left(launch_starts, start_cpu)
-        right_idx = bisect.bisect_right(launch_starts, end_cpu)
-
-        # Get correlation IDs for launches in range - O(range size)
-        corr_ids = set(sorted_launches[i][2] for i in range(left_idx, right_idx))
-
-        # Find all GPU kernels using the mapping - O(range size)
-        iter_kernels: list[CuptiKernelInfo] = []
-        for corr_id in corr_ids:
-            if corr_id in corr_id_to_kernels:
-                iter_kernels.extend(corr_id_to_kernels[corr_id])
-
-        if not iter_kernels:
-            raise ValueError(f"No kernel activities recorded for iteration {idx}")
-        current_kernel_names = set(generate_kernel_string(k) for k in iter_kernels)
-        # check if the kernel names are consistent
-        if kernel_names is None:
-            kernel_names = current_kernel_names
-        else:
-            if kernel_names != current_kernel_names:
-                raise ValueError(
-                    f"Inconsistent kernel names: {kernel_names} != {current_kernel_names}"
-                )
+        left_idx = bisect.bisect_left(kernel_starts, start_cpu)
+        right_idx = bisect.bisect_right(kernel_starts, end_cpu)
+        window_kernels: list[CuptiKernelInfo] = sorted_kernels[left_idx:right_idx]
+        iter_kernels = select_activity_sequence(
+            window_kernels,
+            expected_kernel_names,
+            iteration=idx,
+        )
+        assert kernel_activity_counts(iter_kernels) == expected_kernel_counts
         min_start = min(k.start for k in iter_kernels)
         max_end = max(k.end for k in iter_kernels)
-        span_ms = (max_end - min_start) / 1e6  # ns to ms
-        measured_times.append(span_ms)
+        measured_times.append((max_end - min_start) / 1e6)
     return measured_times
 
 
@@ -397,6 +258,7 @@ def bench_time_with_cuda_events(
     for _ in range(warmup):
         args = setup()
         # always clear cache after setup to prevent data residing in L2
+        _reset_persisting_l2_cache(device)
         _clear_cache(cache)
         fn(args)
 
@@ -405,6 +267,7 @@ def bench_time_with_cuda_events(
     # to keep the driver's GPU queue full.
     for i in range(rep):
         args = setup()
+        _reset_persisting_l2_cache(device)
         _clear_cache(cache)
         start_events[i].record()
         fn(args)
@@ -424,6 +287,7 @@ def time_runnable(
     rep: int = 100,
     return_mode: Literal["mean", "median", "all"] = "median",
     methodology: Literal["cuda_events", "cupti"] = "cupti",
+    seed: int = 0,
 ) -> Union[float, list[float]]:
     """Time the execution of a callable using CUDA events.
 
@@ -452,6 +316,8 @@ def time_runnable(
         How to summarize the timing results (default: ``"median"``).
     methodology : {"cuda_events", "cupti"}
         The methodology to use for timing (default: ``"cupti"``). CUPTI is used by nsys to measure the actual GPU kernel execution time, excluding CPU-side launch overhead.
+    seed : int
+        Seed for the allocator's randomized pointer-shift sequence.
 
     Returns
     -------
@@ -459,24 +325,37 @@ def time_runnable(
         Benchmark result(s) in milliseconds.
     """
     total_iterations = warmup + rep
-    allocator = ShiftingMemoryPoolAllocator(inputs, outputs, total_iterations)
     with torch.cuda.device(device):
         if methodology == "cuda_events":
-            times = bench_time_with_cuda_events(
-                fn=lambda args: fn(*args),
-                warmup=warmup,
-                rep=rep,
-                setup=allocator.get_unique_args,
-                device=device,
+            allocator = ShiftingMemoryPoolAllocator(
+                inputs, outputs, total_iterations, seed=seed
             )
+            try:
+                times = bench_time_with_cuda_events(
+                    fn=lambda args: fn(*args),
+                    warmup=warmup,
+                    rep=rep,
+                    setup=allocator.get_unique_args,
+                    device=device,
+                )
+            finally:
+                del allocator
         elif methodology == "cupti":
-            times = bench_gpu_time_with_cupti(
-                fn=lambda args: fn(*args),
-                warmup=warmup,
-                rep=rep,
-                setup=allocator.get_unique_args,
-                device=device,
+            allocator = ShiftingMemoryPoolAllocator(
+                inputs, outputs, total_iterations + 1, seed=seed
             )
+            try:
+                times = bench_gpu_time_with_cupti(
+                    fn=lambda args: fn(*args),
+                    warmup=warmup,
+                    rep=rep,
+                    setup=allocator.get_unique_args,
+                    device=device,
+                )
+            finally:
+                del allocator
+        else:
+            raise ValueError(f"Unknown methodology: {methodology}")
         if not times:
             raise ValueError(f"No timing results for methodology: {methodology}")
         return _summarize_statistics(times, return_mode)

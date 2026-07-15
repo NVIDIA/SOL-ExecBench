@@ -14,11 +14,13 @@
 # limitations under the License.
 
 import math
+import warnings
 from pathlib import Path
 
 import pytest
 import torch
 
+import sol_execbench.core.bench.io as io_mod
 from sol_execbench.core.bench.io import (
     ShiftingMemoryPoolAllocator,
     _cast_to_fp4x2,
@@ -444,6 +446,23 @@ class TestResolveBlobPath:
 
 
 class TestShiftingMemoryPoolAllocator:
+    def test_rebase_falls_back_for_dlpack_unsupported_dtype(self, monkeypatch):
+        backing = torch.arange(32, dtype=torch.uint8)
+        source = backing[3:19]
+
+        def unsupported(_tensor):
+            raise BufferError("float8 types are not supported by dlpack")
+
+        monkeypatch.setattr(io_mod.dlpack, "from_dlpack", unsupported)
+
+        rebased = io_mod._rebase_tensor_storage(source)
+
+        assert rebased.storage_offset() == 0
+        assert rebased._base is None
+        assert rebased.data_ptr() == source.data_ptr()
+        assert rebased.untyped_storage().data_ptr() == source.data_ptr()
+        assert torch.equal(rebased, source)
+
     def test_unique_data_ptr_per_call(self):
         """Each call to get_unique_args returns tensors with distinct data_ptr."""
         inputs = [torch.randn(4, 8), torch.randn(16)]
@@ -457,14 +476,44 @@ class TestShiftingMemoryPoolAllocator:
         # All pointer tuples should be unique
         assert len(set(ptrs)) == 10
 
-    def test_data_ptr_shifts_by_alignment(self):
-        """Consecutive calls shift data_ptr by _POOL_ALIGNMENT bytes."""
+    def test_data_ptr_shifts_by_random_alignment_multiple(self):
+        align = ShiftingMemoryPoolAllocator._POOL_ALIGNMENT
+        max_shift = ShiftingMemoryPoolAllocator._MAX_SHIFT_BYTES
         t = torch.randn(64)
-        alloc = ShiftingMemoryPoolAllocator([t], [], total_iterations=5)
+        alloc = ShiftingMemoryPoolAllocator([t], [], total_iterations=64, seed=200)
 
-        ptrs = [alloc.get_unique_args()[0].data_ptr() for _ in range(5)]
-        diffs = [ptrs[i + 1] - ptrs[i] for i in range(4)]
-        assert all(d == ShiftingMemoryPoolAllocator._POOL_ALIGNMENT for d in diffs)
+        ptrs = [alloc.get_unique_args()[0].data_ptr() for _ in range(64)]
+        diffs = [ptrs[i + 1] - ptrs[i] for i in range(len(ptrs) - 1)]
+        assert all(d > 0 and d % align == 0 for d in diffs)
+        assert all(align <= d <= max_shift for d in diffs)
+        assert len(set(diffs)) > 1
+
+    def test_shift_sequence_is_reproducible_per_seed(self):
+        t = torch.randn(64)
+
+        def diffs_for_seed(seed):
+            alloc = ShiftingMemoryPoolAllocator([t], [], 32, seed=seed)
+            ptrs = [alloc.get_unique_args()[0].data_ptr() for _ in range(32)]
+            return [ptrs[i + 1] - ptrs[i] for i in range(len(ptrs) - 1)]
+
+        assert diffs_for_seed(200) == diffs_for_seed(200)
+        assert diffs_for_seed(200) != diffs_for_seed(201)
+
+    def test_visible_storage_rebased_to_shifted_data_ptr(self):
+        alloc = ShiftingMemoryPoolAllocator([torch.randn(64)], [], 5)
+
+        storage_ids = []
+        for _ in range(5):
+            shifted = alloc.get_unique_args()[0]
+            storage_ids.append(shifted.untyped_storage()._cdata)
+            assert shifted.storage_offset() == 0
+            assert shifted._base is None
+            assert shifted.untyped_storage().data_ptr() == shifted.data_ptr()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                assert shifted.storage().data_ptr() == shifted.data_ptr()
+
+        assert len(set(storage_ids)) == 5
 
     def test_input_data_preserved(self):
         """Returned views contain the same data as the original input."""
@@ -559,8 +608,16 @@ class TestShiftingMemoryPoolAllocator:
 
         entry = alloc._input_entries[0]
         pool_numel = entry["pool"].numel()
-        expected = entry["storage_span"] + (iters - 1) * (256 // src.element_size())
-        assert pool_numel == expected
+        block_numel = 256 // src.element_size()
+        assert (
+            pool_numel == entry["storage_span"] + alloc._offset_blocks[-1] * block_numel
+        )
+        overhead = pool_numel - entry["storage_span"]
+        max_shift_numel = (
+            ShiftingMemoryPoolAllocator._MAX_SHIFT_BYTES // src.element_size()
+        )
+        assert (iters - 1) * block_numel <= overhead <= (iters - 1) * max_shift_numel
+        assert pool_numel < src.numel() * iters
 
     def test_expanded_tensor_preserves_strides(self):
         """Expanded (stride-0) tensors store only physical elements, not logical numel."""
@@ -576,13 +633,16 @@ class TestShiftingMemoryPoolAllocator:
         entry = alloc._input_entries[0]
         # Pool should be sized by storage_span (seq), not logical numel (batch*seq)
         assert entry["storage_span"] == seq
-        expected_pool = seq + (iters - 1) * (256 // src.element_size())
+        expected_pool = seq + alloc._offset_blocks[-1] * (256 // src.element_size())
         assert entry["pool"].numel() == expected_pool
 
         for _ in range(iters):
             args = alloc.get_unique_args()
             assert args[0].shape == (batch, seq)
             assert args[0].stride() == (0, 1)
+            assert args[0].storage_offset() == 0
+            assert args[0]._base is None
+            assert args[0].untyped_storage().data_ptr() == args[0].data_ptr()
             # Every row should equal the original
             assert torch.equal(args[0][0], row)
             assert torch.equal(args[0][batch - 1], row)
