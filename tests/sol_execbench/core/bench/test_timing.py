@@ -17,12 +17,16 @@
 """Tests for sol_execbench.core.bench.timing."""
 
 import statistics
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sol_execbench.core.bench.io import ShiftingMemoryPoolAllocator
+from sol_execbench.core.bench import timing as timing_module
 from sol_execbench.core.bench.timing import (
+    _reset_persisting_l2_cache,
     _summarize_statistics,
     bench_gpu_time_with_cupti,
     bench_time_with_cuda_events,
@@ -82,6 +86,232 @@ class TestSummarizeStatistics:
     def test_all(self):
         times = [1.0, 2.0, 3.0]
         assert _summarize_statistics(times, "all") == times
+
+
+# ---------------------------------------------------------------------------
+# Persisting L2 reset and CUPTI activity attribution
+# ---------------------------------------------------------------------------
+
+
+class TestCuptiTimingAttribution:
+    def test_reset_persisting_l2_cache_checks_runtime_result(self, monkeypatch):
+        check_errors = []
+
+        monkeypatch.setattr(
+            timing_module.cuda_runtime,
+            "cudaCtxResetPersistingL2Cache",
+            lambda: 0,
+        )
+        monkeypatch.setattr(torch.cuda, "check_error", check_errors.append)
+
+        _reset_persisting_l2_cache()
+
+        assert check_errors == [0]
+
+    def test_reset_persisting_l2_cache_uses_requested_device(self, monkeypatch):
+        devices = []
+        check_errors = []
+
+        @contextmanager
+        def fake_device(device):
+            devices.append(device)
+            yield
+
+        monkeypatch.setattr(
+            timing_module.cuda_runtime,
+            "cudaCtxResetPersistingL2Cache",
+            lambda: 0,
+        )
+        monkeypatch.setattr(torch.cuda, "check_error", check_errors.append)
+        monkeypatch.setattr(torch.cuda, "device", fake_device)
+
+        _reset_persisting_l2_cache("cuda:2")
+
+        assert devices == ["cuda:2"]
+        assert check_errors == [0]
+
+    def test_cupti_reset_precedes_cache_clear(self, monkeypatch):
+        calls = []
+
+        class Kernel:
+            def __init__(self, correlation_id, start, end):
+                self.correlation_id = correlation_id
+                self.start = start
+                self.end = end
+
+            def kernel_string(self):
+                return "kernel"
+
+        buffers = iter(
+            [
+                SimpleNamespace(kernels=[Kernel(correlation_id=1, start=10, end=20)]),
+                SimpleNamespace(
+                    kernels=[
+                        Kernel(correlation_id=2, start=120, end=130),
+                        Kernel(correlation_id=3, start=320, end=330),
+                    ]
+                ),
+            ]
+        )
+
+        @contextmanager
+        def collect_activities(*_, **__):
+            yield next(buffers)
+
+        timestamps = iter([90, 200, 290, 400])
+
+        def setup():
+            calls.append("setup")
+            return "data"
+
+        def fn(data):
+            calls.append(f"fn:{data}")
+
+        monkeypatch.setattr(
+            timing_module, "_get_empty_cache_for_benchmark", lambda device: object()
+        )
+        monkeypatch.setattr(
+            timing_module,
+            "_reset_persisting_l2_cache",
+            lambda device=None: calls.append(f"reset:{device}"),
+        )
+        monkeypatch.setattr(
+            timing_module, "_clear_cache", lambda cache: calls.append("clear")
+        )
+        monkeypatch.setattr(
+            timing_module, "collect_cupti_activities", collect_activities
+        )
+        monkeypatch.setattr(
+            timing_module.cupti, "get_timestamp", lambda: next(timestamps)
+        )
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+
+        assert bench_gpu_time_with_cupti(
+            fn, warmup=1, rep=2, setup=setup
+        ) == pytest.approx([1e-05, 1e-05])
+
+        assert [call for call in calls if call != "sync"] == [
+            "setup",
+            "reset:cuda",
+            "clear",
+            "fn:data",
+            "setup",
+            "reset:cuda",
+            "clear",
+            "fn:data",
+            "setup",
+            "reset:cuda",
+            "clear",
+            "fn:data",
+            "setup",
+            "reset:cuda",
+            "clear",
+            "fn:data",
+        ]
+
+    @staticmethod
+    def _kernel(name, correlation_id, start, end):
+        return SimpleNamespace(
+            correlation_id=correlation_id,
+            start=start,
+            end=end,
+            kernel_string=lambda: name,
+        )
+
+    @staticmethod
+    def _mock_cupti(monkeypatch, discovery_kernels, timing_kernels, timestamps):
+        buffers = iter(
+            [
+                SimpleNamespace(kernels=discovery_kernels),
+                SimpleNamespace(kernels=timing_kernels),
+            ]
+        )
+
+        @contextmanager
+        def collect_activities(*_, **__):
+            yield next(buffers)
+
+        timestamp_iter = iter(timestamps)
+        monkeypatch.setattr(
+            timing_module, "collect_cupti_activities", collect_activities
+        )
+        monkeypatch.setattr(
+            timing_module.cupti,
+            "get_timestamp",
+            lambda: next(timestamp_iter),
+        )
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    def test_cupti_timing_includes_delayed_gpu_activity(self, monkeypatch):
+        self._mock_cupti(
+            monkeypatch,
+            [
+                self._kernel("primary", 1, 10, 20),
+                self._kernel("secondary", 2, 30, 40),
+            ],
+            [
+                self._kernel("primary", 3, 120, 140),
+                self._kernel("secondary", 4, 260, 300),
+            ],
+            [100, 400],
+        )
+
+        assert bench_gpu_time_with_cupti(
+            lambda: None,
+            warmup=0,
+            rep=1,
+            cold_l2_cache=False,
+        ) == pytest.approx([0.00018])
+
+    def test_cupti_timing_filters_setup_activities(self, monkeypatch):
+        self._mock_cupti(
+            monkeypatch,
+            [
+                self._kernel("user_a", 1, 10, 20),
+                self._kernel("user_b", 2, 25, 35),
+            ],
+            [
+                self._kernel("setup_copy", 3, 105, 145),
+                self._kernel("cache_clear", 4, 150, 200),
+                self._kernel("user_a", 5, 225, 245),
+                self._kernel("user_b", 6, 260, 290),
+            ],
+            [100, 400],
+        )
+
+        assert bench_gpu_time_with_cupti(
+            lambda: None,
+            warmup=0,
+            rep=1,
+            cold_l2_cache=False,
+        ) == pytest.approx([0.000065])
+
+    def test_cupti_timing_accepts_reordered_user_activity(self, monkeypatch):
+        self._mock_cupti(
+            monkeypatch,
+            [
+                self._kernel("user_a", 1, 10, 20),
+                self._kernel("user_b", 2, 25, 35),
+                self._kernel("user_a", 3, 40, 50),
+                self._kernel("user_c", 4, 55, 65),
+            ],
+            [
+                self._kernel("setup_copy", 5, 95, 99),
+                self._kernel("user_a", 6, 100, 105),
+                self._kernel("user_c", 7, 110, 115),
+                self._kernel("user_a", 8, 120, 125),
+                self._kernel("user_b", 9, 130, 135),
+                self._kernel("user_a", 10, 150, 155),
+            ],
+            [100, 400],
+        )
+
+        assert bench_gpu_time_with_cupti(
+            lambda: None,
+            warmup=0,
+            rep=1,
+            cold_l2_cache=False,
+        ) == pytest.approx([0.000045])
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +712,7 @@ class TestBenchGPUTimeWithCuptiGPU:
         2. Expensive: allocator + a large matmul (~1-2ms GPU work)
         """
         warmup, rep = 10, 50
-        total = warmup + rep
+        total = warmup + rep + 1
         base = torch.zeros(64, device="cuda")
         burn = torch.randn(2048, 2048, device="cuda")
 
@@ -513,9 +743,9 @@ class TestBenchGPUTimeWithCuptiGPU:
         )
 
     def test_setup_called_every_iteration(self):
-        """ShiftingMemoryPoolAllocator is called once per warmup + timed iteration."""
+        """Setup is called for warmup, discovery, and timed iterations."""
         warmup, rep = 5, 20
-        total = warmup + rep
+        total = warmup + rep + 1
         t = torch.zeros(1, device="cuda")
         allocator = ShiftingMemoryPoolAllocator([t], [], total)
 
@@ -540,7 +770,7 @@ class TestBenchGPUTimeWithCuptiGPU:
         should not affect the measured kernel time.
         """
         warmup, rep = 10, 50
-        total = warmup + rep
+        total = warmup + rep + 1
         t = torch.randn(1024, 1024, device="cuda")
 
         # No setup — fn closes over `t`, same data every iteration
@@ -572,7 +802,7 @@ class TestBenchGPUTimeWithCuptiGPU:
         measured kernel time, because setup is outside the timed region.
         """
         warmup, rep = 10, 50
-        total = warmup + rep
+        total = warmup + rep + 1
         kernel_input = torch.randn(512, 512, device="cuda")
 
         # Small extra tensor (1KB) alongside the kernel input

@@ -593,6 +593,7 @@ for _workload in workloads:
             _device,
             warmup=bench_config.warmup_runs,
             rep=bench_config.iterations,
+            seed=bench_config.seed,
         )
     except Exception as _e:
         _emit(
@@ -628,6 +629,7 @@ for _workload in workloads:
                 _device,
                 warmup=bench_config.warmup_runs,
                 rep=bench_config.iterations,
+                seed=bench_config.seed,
             )
         except Exception:
             pass
