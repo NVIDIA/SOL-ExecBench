@@ -27,7 +27,7 @@ ARG HOST_GID=1000
 ARG HOST_USER=sol-execbench
 
 # Copy uv binary early (changes rarely)
-COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.11.26 /uv /usr/local/bin/uv
 
 # sudo: allows eval driver to call nvidia-smi for GPU clock locking
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -75,11 +75,17 @@ COPY --chown=${HOST_UID}:${HOST_GID} src/ ./src/
 
 # Install the project itself (creates the sol-execbench console script).
 RUN --mount=type=cache,target=/home/${HOST_USER}/.cache/uv,uid=${HOST_UID},gid=${HOST_GID} \
-    uv sync --frozen --no-editable --all-groups
+    uv sync --frozen --no-editable --all-groups && \
+    uv pip uninstall --python "$UV_PROJECT_ENVIRONMENT" triton && \
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT" --no-deps "fbtriton==3.7.1" && \
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT" --no-deps --force-reinstall \
+        "nvidia-cutlass-dsl-libs-cu13==4.4.2"
 
 # Set runtime environment.
 # PYTHONPATH lets the volume-mounted src/ override the installed package at runtime.
+# LD_LIBRARY_PATH lets runtime NVRTC compiles find libnvrtc-builtins.so.13.0.
 ENV PATH="/venv/bin:${PATH}" \
+    LD_LIBRARY_PATH="/venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}" \
     PYTHONPATH="/sol-execbench/src"
 
 ENTRYPOINT ["/entrypoint.sh"]
