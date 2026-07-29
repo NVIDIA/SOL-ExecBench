@@ -15,7 +15,7 @@
 
 """Reward hack defenses for SOL ExecBench evaluation.
 
-Provides detection functions for four common reward-hacking patterns.
+Provides detection functions for five common reward-hacking patterns.
 The identity of torch.cuda.Event.elapsed_time is captured at module load
 time — before any user code is imported — so patching after the fact is
 detected.
@@ -23,9 +23,11 @@ detected.
 
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, List, Sequence
 
 import torch
+
+from sol_execbench.core.bench.correctness import compute_error_stats
 
 # ---------------------------------------------------------------------------
 # Capture timing function identity at module load, before any user code runs.
@@ -99,6 +101,62 @@ def check_lazy_outputs(outputs: List[Any]) -> None:
         if type(t) is not torch.Tensor:
             raise RewardHackDetected(
                 f"Lazy evaluation detected: output is {type(t).__name__}, not torch.Tensor"
+            )
+
+
+def check_timed_outputs(
+    outputs: Sequence[Any],
+    reference: Sequence[Any],
+    tolerance: Any,
+) -> None:
+    """Verify that a call made *during the timing loop* is still correct.
+
+    Correctness and performance are otherwise measured over two disjoint sets
+    of calls, and the outputs produced during timing are never inspected.  A
+    submission can therefore compute real results while correctness is being
+    checked and skip the work once timing starts — the measured latency then
+    reflects an empty kernel rather than the kernel under test.
+
+    The caller obtains *outputs* from an extra, untimed call placed at an
+    unpredictable point inside the measured loop (see
+    :func:`~sol_execbench.core.bench.timing.time_runnable`), so a submission
+    cannot tell it apart from a measured call.
+
+    Args:
+        outputs: Outputs produced by the audited call.
+        reference: Ground-truth outputs for the same inputs.
+        tolerance: Workload tolerance, as passed to
+            :func:`~sol_execbench.core.bench.correctness.compute_error_stats`.
+
+    Raises:
+        RewardHackDetected: If the audited call produced a different number of
+            outputs, changed a shape/dtype, or exceeded the tolerance.
+    """
+    if len(outputs) != len(reference):
+        raise RewardHackDetected(
+            f"Timed call produced {len(outputs)} output(s), expected "
+            f"{len(reference)}: the solution behaves differently once timing "
+            f"begins"
+        )
+
+    for idx, (got, want) in enumerate(zip(outputs, reference)):
+        if not isinstance(got, torch.Tensor):
+            raise RewardHackDetected(
+                f"Timed call output {idx} is {type(got).__name__}, not a Tensor"
+            )
+        if got.shape != want.shape or got.dtype != want.dtype:
+            raise RewardHackDetected(
+                f"Timed call output {idx} changed from {tuple(want.shape)}/"
+                f"{want.dtype} to {tuple(got.shape)}/{got.dtype} after the "
+                f"correctness phase"
+            )
+
+        stats, exceeds = compute_error_stats(got, want, tolerance)
+        if exceeds:
+            raise RewardHackDetected(
+                f"Timed call output {idx} does not match the reference "
+                f"(max_absolute_error={stats.max_absolute_error:.3e}): the "
+                f"solution stopped producing correct results once timing began"
             )
 
 

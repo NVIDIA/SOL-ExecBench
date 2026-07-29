@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import secrets
 import statistics
 from collections.abc import Callable
 from typing import Any, Literal, Union
@@ -100,6 +101,18 @@ def _reset_persisting_l2_cache(
     reset_current_device()
 
 
+def _audit_index(rep: int, audit: Callable | None) -> int:
+    """Pick the measured iteration after which the audit hook runs.
+
+    Drawn from a cryptographic source rather than the seeded RNG: the benchmark
+    seed is part of the published problem, so a seeded draw would be
+    predictable by the submission being audited.
+    """
+    if audit is None or rep <= 0:
+        return -1
+    return secrets.randbelow(rep)
+
+
 def clone_args(args: list[Any]) -> list[Any]:
     """Clone tensor arguments to prevent cross-iteration data contamination.
 
@@ -116,6 +129,7 @@ def bench_gpu_time_with_cupti(
     setup: Callable[[], Any] | None = None,
     cold_l2_cache: bool = True,
     device="cuda",
+    audit: Callable[[], None] | None = None,
 ):
     """Benchmark GPU time using the discovered user CUPTI activity sequence.
 
@@ -123,6 +137,14 @@ def bench_gpu_time_with_cupti(
     sequence after warmup, then selecting only that sequence from every timed
     iteration. The end timestamp is captured after synchronization so delayed
     or non-default-stream work remains inside the attribution window.
+
+    *audit*, if given, is run once at an unpredictable point inside the measured
+    loop, between one iteration's end timestamp and the next iteration's start
+    timestamp — so its activities fall outside every attribution window and the
+    reported latencies are unchanged.  Raising from the hook aborts the
+    benchmark.  It exists so that a call the submission cannot distinguish from
+    a measured one can be checked for correctness: correctness and timing are
+    otherwise established over disjoint sets of calls.
     """
     if setup is None:
         _fn = fn
@@ -172,18 +194,24 @@ def bench_gpu_time_with_cupti(
         raise ValueError("No kernel activities recorded during discovery iteration")
     expected_kernel_counts = kernel_activity_counts(expected_kernels)
 
+    audit_after = _audit_index(rep, audit)
     iter_timestamps = []
     with collect_cupti_activities(
         activity_kinds=GPU_TIMING_ACTIVITY_KINDS
     ) as cupti_buffers:
         torch.cuda.synchronize()
-        for _ in range(rep):
+        for i in range(rep):
             args = prepare_iteration(synchronize=False)
             start_cpu = cupti.get_timestamp()
             runner(args)
             torch.cuda.synchronize()
             end_cpu = cupti.get_timestamp()
             iter_timestamps.append((start_cpu, end_cpu))
+            if i == audit_after:
+                # Untimed: runs after this iteration's end_cpu and before the
+                # next start_cpu, so no attribution window contains it.
+                audit()
+                torch.cuda.synchronize()
         torch.cuda.synchronize()
 
     sorted_kernels = sorted(
@@ -214,6 +242,7 @@ def bench_time_with_cuda_events(
     rep: int = 100,
     setup: Callable[[], Any] | None = None,
     device: str = "cuda",
+    audit: Callable[[], None] | None = None,
 ) -> Union[float, list[float]]:
     """Benchmark the runtime of the provided function.
 
@@ -235,6 +264,10 @@ def bench_time_with_cuda_events(
         Setup time is **not** included in measurements. This method should only enqueue operations onto the default stream and should not explcitly synchronize.
     device : str
         CUDA device for cache-clearing buffer (default: ``"cuda"``).
+    audit : Callable[[], None] | None
+        Run once at an unpredictable point inside the measured loop, enqueued
+        between one iteration's end event and the next iteration's start event
+        so its work is not timed.  Raising from the hook aborts the benchmark.
 
     Returns
     -------
@@ -265,6 +298,7 @@ def bench_time_with_cuda_events(
     # Timed iterations.
     # Avoid synchronizations after warmup and in this hot loop
     # to keep the driver's GPU queue full.
+    audit_after = _audit_index(rep, audit)
     for i in range(rep):
         args = setup()
         _reset_persisting_l2_cache(device)
@@ -272,6 +306,10 @@ def bench_time_with_cuda_events(
         start_events[i].record()
         fn(args)
         end_events[i].record()
+        if i == audit_after:
+            # Untimed: enqueued after this iteration's end event and before the
+            # next iteration's start event.
+            audit()
 
     torch.cuda.synchronize()
     measured_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
@@ -288,6 +326,7 @@ def time_runnable(
     return_mode: Literal["mean", "median", "all"] = "median",
     methodology: Literal["cuda_events", "cupti"] = "cupti",
     seed: int = 0,
+    audit: Callable[[], None] | None = None,
 ) -> Union[float, list[float]]:
     """Time the execution of a callable using CUDA events.
 
@@ -318,6 +357,18 @@ def time_runnable(
         The methodology to use for timing (default: ``"cupti"``). CUPTI is used by nsys to measure the actual GPU kernel execution time, excluding CPU-side launch overhead.
     seed : int
         Seed for the allocator's randomized pointer-shift sequence.
+    audit : Callable[[], None] | None
+        If given, run once **untimed** at an unpredictable point inside the
+        measured loop.  The hook is expected to invoke the kernel itself and
+        raise if the result is wrong; this module only guarantees *when* it
+        runs.
+
+        Without it, correctness and performance are established over two
+        disjoint sets of calls and the outputs of the timed calls are never
+        inspected — so a submission can produce real results while correctness
+        is being checked and skip the work once timing begins.  Because the
+        audited call sits among the measured ones, the submission has to keep
+        working for the whole benchmark.
 
     Returns
     -------
@@ -337,6 +388,7 @@ def time_runnable(
                     rep=rep,
                     setup=allocator.get_unique_args,
                     device=device,
+                    audit=audit,
                 )
             finally:
                 del allocator
@@ -351,6 +403,7 @@ def time_runnable(
                     rep=rep,
                     setup=allocator.get_unique_args,
                     device=device,
+                    audit=audit,
                 )
             finally:
                 del allocator

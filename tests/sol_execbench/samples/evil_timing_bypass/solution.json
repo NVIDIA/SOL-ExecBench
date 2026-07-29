@@ -1,0 +1,15 @@
+{
+  "name": "evil_timing_bypass",
+  "definition": "evil_test_vecadd",
+  "author": "test",
+  "spec": {
+    "languages": ["pytorch"],
+    "target_hardware": ["LOCAL"],
+    "entry_point": "kernel.py::run",
+    "dependencies": ["torch"],
+    "destination_passing_style": false
+  },
+  "sources": [
+    {"path": "kernel.py", "content": ""}
+  ]
+}

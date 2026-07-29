@@ -129,6 +129,7 @@ from sol_execbench.core.bench.reward_hack import (  # noqa: E402
     check_lazy_outputs,
     check_monkey_patch,
     check_thread_injection,
+    check_timed_outputs,
     snapshot_critical_functions,
 )
 from sol_execbench.core.bench.timing import time_runnable  # noqa: E402
@@ -191,6 +192,7 @@ _CRITICAL_NAMES = [
     "check_monkey_patch",
     "check_lazy_outputs",
     "check_thread_injection",
+    "check_timed_outputs",
     "check_eval_integrity",
     "_call_and_collect_outputs",
     "gen_inputs",
@@ -581,7 +583,58 @@ for _workload in workloads:
     if _reward_hack_check(_workload, check_monkey_patch):
         continue
 
-    # -- User latency measurement --
+    # -- Timing-phase audit --
+    # Correctness above and timing below run over two disjoint sets of calls,
+    # and the outputs of the timed calls are never inspected.  Audit one call
+    # from inside the measured loop, at an index the solution cannot predict.
+    # The audit uses *fresh* inputs with their own reference outputs, so a
+    # solution that replays a cached result is caught alongside one that simply
+    # stops computing.
+    _audit_ready = True
+    try:
+        _audit_inputs = gen_inputs(
+            definition,
+            _workload,
+            device=_device,
+            safe_tensors=_safe_tensors or None,
+            custom_inputs_fn=_custom_inputs_fn,
+        )
+        _audit_reference = _call_and_collect_outputs(
+            ref_fn,
+            _audit_inputs,
+            False,
+            definition,
+            _resolved_axes,
+            _device,
+            _output_names,
+            _output_dtypes_torch,
+        )
+    except Exception:
+        # Never let audit setup fail a solution; the reference already ran
+        # successfully above, so this is an infrastructure problem.
+        _audit_ready = False
+
+    def _audit_timed_call():
+        if not _audit_ready:
+            return
+        try:
+            _audit_outputs = _call_and_collect_outputs(
+                user_fn,
+                _audit_inputs,
+                _dps,
+                definition,
+                _resolved_axes,
+                _device,
+                _output_names,
+                _output_dtypes_torch,
+            )
+        except Exception as _ae:
+            raise RewardHackDetected(
+                f"Kernel raised on a call made during the timing loop ({_ae}); "
+                f"the solution behaves differently once timing begins"
+            ) from _ae
+        check_timed_outputs(_audit_outputs, _audit_reference, _workload.tolerance)
+
     try:
         _timing_outputs = (
             allocate_outputs(definition, _resolved_axes, _device) if _dps else []
@@ -594,7 +647,20 @@ for _workload in workloads:
             warmup=bench_config.warmup_runs,
             rep=bench_config.iterations,
             seed=bench_config.seed,
+            audit=_audit_timed_call,
         )
+    except RewardHackDetected as _e:
+        _emit(
+            Trace(
+                definition=definition.name,
+                solution=_solution_name,
+                workload=_workload,
+                evaluation=_make_eval(
+                    EvaluationStatus.REWARD_HACK, _device, None, extra_msg=str(_e)
+                ),
+            )
+        )
+        continue
     except Exception as _e:
         _emit(
             Trace(

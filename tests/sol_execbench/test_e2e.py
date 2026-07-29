@@ -78,7 +78,9 @@ class EvilCase:
 # Inline problem definition for evil-case e2e tests.
 _EVIL_DEFINITION_DICT = {
     "name": "evil_test_vecadd",
-    "axes": {"n": {"type": "const", "value": 256}},
+    # A var axis with differently-shaped workloads: solutions that keep
+    # per-shape state (evil_timing_bypass) then behave the same on both.
+    "axes": {"n": {"type": "var"}},
     "inputs": {
         "x": {"shape": ["n"], "dtype": "float32"},
         "y": {"shape": ["n"], "dtype": "float32"},
@@ -89,12 +91,12 @@ _EVIL_DEFINITION_DICT = {
 
 _EVIL_WORKLOAD_DICTS = [
     {
-        "axes": {},
+        "axes": {"n": 256},
         "inputs": {"x": {"type": "random"}, "y": {"type": "random"}},
         "uuid": "evil-wkl-0001",
     },
     {
-        "axes": {},
+        "axes": {"n": 512},
         "inputs": {"x": {"type": "random"}, "y": {"type": "random"}},
         "uuid": "evil-wkl-0002",
     },
@@ -104,6 +106,7 @@ _EVIL_CASES = [
     EvilCase("evil_monkey_patch", "evil_monkey_patch", "monkey-patched"),
     EvilCase("evil_thread_inject", "evil_thread_inject", "thread"),
     EvilCase("evil_lazy_output", "evil_lazy_output", "_FakeTensor"),
+    EvilCase("evil_timing_bypass", "evil_timing_bypass", "timing began"),
 ]
 
 _CASES = [

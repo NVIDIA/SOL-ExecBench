@@ -25,8 +25,10 @@ from sol_execbench.core.bench.reward_hack import (
     check_lazy_outputs,
     check_monkey_patch,
     check_thread_injection,
+    check_timed_outputs,
     snapshot_critical_functions,
 )
+from sol_execbench.core.data.workload import ToleranceSpec
 
 # ── check_monkey_patch ────────────────────────────────────────────────────────
 
@@ -107,6 +109,56 @@ class TestCheckLazyOutputs:
 
 
 # ── snapshot_critical_functions / check_eval_integrity ───────────────────────
+
+
+class TestCheckTimedOutputs:
+    TOL = ToleranceSpec()
+
+    def test_passes_when_outputs_match(self):
+        ref = [torch.ones(16), torch.zeros(16)]
+        got = [torch.ones(16), torch.zeros(16)]
+        check_timed_outputs(got, ref, self.TOL)  # must not raise
+
+    def test_passes_within_tolerance(self):
+        ref = [torch.ones(16)]
+        got = [torch.ones(16) + 1e-6]
+        check_timed_outputs(got, ref, self.TOL)  # must not raise
+
+    def test_raises_when_values_diverge(self):
+        """The kernel stopped computing once timing began."""
+        ref = [torch.ones(16)]
+        got = [torch.zeros(16)]
+        with pytest.raises(RewardHackDetected, match="timing began"):
+            check_timed_outputs(got, ref, self.TOL)
+
+    def test_raises_on_output_count_mismatch(self):
+        with pytest.raises(RewardHackDetected, match="expected 2"):
+            check_timed_outputs([torch.ones(4)], [torch.ones(4)] * 2, self.TOL)
+
+    def test_raises_on_shape_change(self):
+        with pytest.raises(RewardHackDetected, match="changed from"):
+            check_timed_outputs([torch.ones(8)], [torch.ones(16)], self.TOL)
+
+    def test_raises_on_dtype_change(self):
+        with pytest.raises(RewardHackDetected, match="changed from"):
+            check_timed_outputs(
+                [torch.ones(16, dtype=torch.float16)],
+                [torch.ones(16, dtype=torch.float32)],
+                self.TOL,
+            )
+
+    def test_raises_on_non_tensor_output(self):
+        with pytest.raises(RewardHackDetected, match="not a Tensor"):
+            check_timed_outputs([None], [torch.ones(16)], self.TOL)
+
+    def test_error_message_reports_output_index(self):
+        ref = [torch.ones(4), torch.ones(4)]
+        got = [torch.ones(4), torch.zeros(4)]
+        with pytest.raises(RewardHackDetected, match="output 1"):
+            check_timed_outputs(got, ref, self.TOL)
+
+
+# ── check_eval_integrity ──────────────────────────────────────────────────────
 
 
 class TestEvalIntegrity:

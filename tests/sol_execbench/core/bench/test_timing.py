@@ -602,6 +602,74 @@ class TestBenchTimeWithCUDAEventsGPU:
         assert isinstance(ms, float)
         assert ms > 0
 
+    # -- audit hook ---------------------------------------------------------
+
+    def test_audit_hook_runs_exactly_once(self):
+        """The audit hook fires once per timed run, from inside the loop."""
+        t = torch.randn(256, 256, device="cuda")
+        fired = []
+
+        time_runnable(
+            lambda a: torch.mm(a, a),
+            [t],
+            [],
+            "cuda:0",
+            warmup=3,
+            rep=20,
+            audit=lambda: fired.append(1),
+        )
+        assert len(fired) == 1
+
+    def test_audit_hook_is_optional(self):
+        """Omitting the hook leaves behaviour unchanged."""
+        t = torch.randn(256, 256, device="cuda")
+        ms = time_runnable(
+            lambda a: torch.mm(a, a), [t], [], "cuda:0", warmup=3, rep=20
+        )
+        assert isinstance(ms, float) and ms > 0
+
+    def test_audit_hook_exception_propagates(self):
+        """A raising hook aborts the benchmark so the caller can fail the run."""
+        t = torch.randn(256, 256, device="cuda")
+
+        def boom():
+            raise RuntimeError("audit failed")
+
+        with pytest.raises(RuntimeError, match="audit failed"):
+            time_runnable(
+                lambda a: torch.mm(a, a),
+                [t],
+                [],
+                "cuda:0",
+                warmup=3,
+                rep=20,
+                audit=boom,
+            )
+
+    def test_audit_hook_does_not_inflate_measurement(self):
+        """Audit work is untimed: it must not show up in the reported latency."""
+        t = torch.randn(1024, 1024, device="cuda")
+        heavy = torch.randn(4096, 4096, device="cuda")
+        kwargs = dict(warmup=5, rep=30)
+
+        ms_plain = time_runnable(lambda a: torch.mm(a, a), [t], [], "cuda:0", **kwargs)
+        ms_audited = time_runnable(
+            lambda a: torch.mm(a, a),
+            [t],
+            [],
+            "cuda:0",
+            audit=lambda: torch.mm(heavy, heavy),
+            **kwargs,
+        )
+
+        # The audit runs a matmul ~64x heavier than the kernel; if it were
+        # being attributed to a measured iteration the median would move.
+        ratio = ms_audited / ms_plain
+        assert 0.7 < ratio < 1.4, (
+            f"Audit work leaked into the measurement: plain {ms_plain:.4f}ms "
+            f"vs audited {ms_audited:.4f}ms (ratio {ratio:.2f})"
+        )
+
     def test_time_runnable_large_vs_small(self):
         """time_runnable correctly distinguishes fast and slow kernels."""
         warmup, rep = 5, 30
