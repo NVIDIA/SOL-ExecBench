@@ -80,7 +80,9 @@ class CuptiKernelInfo:
             return "MEMCPY"
         if activity.kind == cupti.ActivityKind.MEMSET:
             return "MEMSET"
-        return None
+        # Activities such as RUNTIME or DRIVER may not provide a name. Fall
+        # back to a stable string so callers always receive a `str`.
+        return getattr(activity, "name", None) or str(activity.kind)
 
     @staticmethod
     def get_bytes(activity):
