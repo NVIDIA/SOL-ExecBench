@@ -129,6 +129,8 @@ def _relative_order_score(candidate_names: list[str], expected_names: list[str])
 
 
 def _kernel_activity_span(kernels: list[CuptiKernelInfo]) -> float:
+    if not kernels:
+        raise ValueError("kernels must contain at least one CUPTI activity")
     return max(kernel.end for kernel in kernels) - min(
         kernel.start for kernel in kernels
     )
