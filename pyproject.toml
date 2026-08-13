@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "sol-execbench"
 version = "1.0.2"
-description = "Add your description here"
+description = "Speed-of-Light GPU kernel evaluation and benchmarking framework"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
