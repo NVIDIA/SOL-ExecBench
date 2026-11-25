@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from os import urandom
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 from torch.utils import dlpack
 
+from sol_execbench.core.bench.reward_hack import RewardHackDetected
 from sol_execbench.core.data import (
     Definition,
     Workload,
@@ -306,8 +309,13 @@ def _generate_heuristic_tensor(
 
     if _is_binary_mask(name, description):
         mask = torch.randint(0, 2, shape, device=device).to(dtype)
-        if audit_changes is not None and mask.numel():
-            audit_changes.append(lambda: mask.view(-1)[::2].fill_(1))
+        if audit_changes is not None and mask.numel() and shape and shape[-1] >= 2:
+
+            def refresh_binary_mask():
+                mask[..., 0].copy_(mask[..., 0] == 0)
+                mask[..., 1].copy_(mask[..., 0] == 0)
+
+            audit_changes.append(refresh_binary_mask)
         return mask
 
     if _is_rope_cos_sin(name):
@@ -342,7 +350,9 @@ def _generate_heuristic_tensor(
         weight = torch.randn(shape, dtype=dtype, device=device) / math.sqrt(fan_in)
         if audit_changes is not None and weight.numel() >= 4:
             quarter = weight.numel() // 4
-            audit_changes.append(lambda: weight.view(-1).narrow(0, quarter, 2 * quarter).neg_())
+            audit_changes.append(
+                lambda: weight.view(-1).narrow(0, quarter, 2 * quarter).neg_()
+            )
         return weight
 
     return None
@@ -492,7 +502,11 @@ def gen_inputs(
                 value = _rand_tensor((), dtype, dev).item()
             else:
                 value = _generate_heuristic_tensor(
-                    name, tuple(shape), dtype, dev, spec.description,
+                    name,
+                    tuple(shape),
+                    dtype,
+                    dev,
+                    spec.description,
                     audit_changes=audit_changes,
                 )
                 if value is None:
@@ -506,28 +520,196 @@ def gen_inputs(
 
 
 def timing_input_stream(
-    generate: Callable[[], list], seed: str, device: str
+    generate: Callable[[], list],
+    device: str,
+    *,
+    record: list[int] | None = None,
+    replay: Iterator[int] | None = None,
+    _entropy=urandom,
 ) -> Callable[[], list]:
-    """Replay the same fresh workload samples for solution and reference timing."""
-    seeds = random.Random(seed)
+    """Draw a fresh OS seed per call, or replay seeds from completed samples.
+
+    Custom factories using private generators must seed those deterministically.
+    """
     dev = torch.device(device)
     devices = [dev] if dev.type == "cuda" else []
+    seen = set()
 
     def next_inputs():
-        sample_seed = seeds.getrandbits(63)
+        if replay is not None:
+            sample_seed = next(replay)
+        else:
+            if urandom is not _entropy:
+                raise RewardHackDetected("Input sampling entropy source was replaced")
+            for _ in range(2):
+                sample_seed = int.from_bytes(_entropy(8), "little") >> 1
+                if sample_seed not in seen:
+                    seen.add(sample_seed)
+                    break
+            else:
+                raise RuntimeError(
+                    "Input sampling repeatedly produced a duplicate seed"
+                )
         python_state = random.getstate()
+        numpy_state = np.random.get_state()
         try:
             with torch.random.fork_rng(devices=devices):
                 random.seed(sample_seed)
+                np.random.seed(sample_seed % 2**32)
                 torch.default_generator.manual_seed(sample_seed)
                 if devices:
                     with torch.cuda.device(dev):
-                        torch.cuda.manual_seed(sample_seed)
-                return generate()
+                        torch.cuda.default_generators[
+                            torch.cuda.current_device()
+                        ].manual_seed(sample_seed)
+                inputs = generate()
+                if record is not None:
+                    record.append(sample_seed)
+                return inputs
         finally:
             random.setstate(python_state)
+            np.random.set_state(numpy_state)
 
     return next_inputs
+
+
+class TimingInputCheck:
+    """Check for repeated draws of built-in inputs that varied in all correctness rounds.
+
+    Clone at most 16 elements before the call; batch host reads outside timing.
+    Custom factories and literals have no contract that their values must vary.
+    """
+
+    def __init__(self, definition: Definition, workload: Workload):
+        self.samples = {
+            (pos, name): []
+            for pos, name in enumerate(definition.inputs)
+            if not isinstance(
+                workload.inputs.get(name), (ScalarInput, SafetensorsInput, CustomInput)
+            )
+        }
+        self._wide_baselines: dict[tuple[int, str], set[bytes]] = {}
+
+    def observe(self, inputs):
+        for (pos, _), samples in self.samples.items():
+            value = inputs[pos]
+            if not isinstance(value, torch.Tensor):
+                samples.append(value)
+                continue
+            if value.ndim and value.numel():
+                axis = max(range(value.ndim), key=value.size)
+                index = [0] * value.ndim
+                index[axis] = slice(None, None, (value.size(axis) + 15) // 16)
+                line = value[tuple(index)]
+                if line.stride(0) == 0:
+                    line = line[:1]
+            else:
+                line = value.reshape(-1)
+            if line.element_size() == 1:
+                line = line.view(torch.uint8)
+            probe = line.detach().clone(memory_format=torch.contiguous_format)
+            samples.append((value.shape, probe))
+        return inputs
+
+    @staticmethod
+    def _values(samples):
+        if not samples or not isinstance(samples[0], tuple):
+            return samples
+        input_shape, first = samples[0]
+        if any(
+            shape != input_shape
+            or probe.shape != first.shape
+            or probe.dtype != first.dtype
+            for shape, probe in samples
+        ):
+            return []
+        rows = torch.stack([probe for _, probe in samples])
+        return [row.tobytes() for row in rows.view(torch.uint8).cpu().numpy()]
+
+    @staticmethod
+    def _is_wide(samples, values):
+        """At least eight sampled elements each took a distinct value on every draw."""
+        if not isinstance(samples[0], tuple):
+            return False
+        width = samples[0][1].element_size()
+        varying_positions = sum(
+            len({row[start : start + width] for row in values}) == len(values)
+            for start in range(0, len(values[0]), width)
+        )
+        return varying_positions >= 8
+
+    def monitor(self, inputs):
+        self._correctness_rounds = len(next(iter(self.samples.values()), ()))
+        monitored = {}
+        for key, samples in self.samples.items():
+            values = self._values(samples)
+            unique = set(values)
+            if len(samples) < 4 or len(unique) != len(samples):
+                continue
+            monitored[key] = []
+            if self._is_wide(samples, values):
+                self._wide_baselines[key] = unique
+        self.samples = monitored
+        if not self.samples or not callable(inputs):
+            return inputs
+        return lambda: self.observe(inputs())
+
+    def check(self):
+        """Reject any reuse for wide probes, but allow natural collisions for narrow ones.
+
+        On longer runs a small input domain can naturally repeat individual values.
+        Count distinct four-sample sequences to detect cycling beyond that baseline.
+        """
+        while self.samples:
+            key, samples = self.samples.popitem()
+            name = key[1]
+            values = self._values(samples)
+            count = len(values)
+            unique = set(values)
+            distinct = len(unique)
+            if key in self._wide_baselines:
+                reused = len(self._wide_baselines.pop(key) & unique)
+                if distinct != count or reused:
+                    raise RewardHackDetected(
+                        f"Timing input '{name}' repeated sampled values "
+                        f"({distinct}/{count} distinct samples; {reused} reused from correctness rounds)"
+                    )
+                continue
+            if count < 4 or distinct == count:
+                continue
+            baseline = min(count, self._correctness_rounds)
+            windows = set(zip(values, values[1:], values[2:], values[3:]))
+            window_count = count - 3
+            if (
+                baseline - distinct > max(1, baseline // 10)
+                or window_count - len(windows) > max(1, window_count // 10)
+                or any(len(set(window)) == 1 for window in windows)
+            ):
+                raise RewardHackDetected(
+                    f"Timing input '{name}' repeated sampled values after varying on "
+                    f"every correctness round ({distinct}/{count} distinct samples; "
+                    f"{len(windows)}/{window_count} distinct four-sample sequences)"
+                )
+
+
+def prepare_timing_inputs(
+    definition: Definition,
+    workload: Workload,
+    generate: Callable[[], list],
+    device: str,
+):
+    """Use fixed CUPTI discovery for literals/fixtures; otherwise replay sampled seeds."""
+    if all(
+        isinstance(workload.inputs.get(name), (ScalarInput, SafetensorsInput))
+        for name in definition.inputs
+    ):
+        inputs = generate()
+        return inputs, inputs
+    seeds: list[int] = []
+    return (
+        timing_input_stream(generate, device, record=seeds),
+        timing_input_stream(generate, device, replay=iter(seeds)),
+    )
 
 
 # ── output generation ────────────────────────────────────────────────────────
@@ -613,6 +795,10 @@ class ShiftingMemoryPoolAllocator:
     copies the current sample into an advancing offset of the pool without
     retaining a full input batch per iteration.
 
+    For growing input spans, replacement pools at least double in capacity.
+    Old pools remain live for pointer uniqueness; together they occupy less
+    than twice the largest pool per input. Tensor dtype and device must stay fixed.
+
     The advance is a seeded random multiple of ``_POOL_ALIGNMENT``. This
     removes the fixed-stride signal that a submission could use to detect the
     timing loop while keeping runs reproducible.
@@ -674,40 +860,23 @@ class ShiftingMemoryPoolAllocator:
             offsets.append(offsets[-1] + rng.randint(1, max_multiplier))
         return offsets
 
-    @staticmethod
-    def _storage_span(tensor: torch.Tensor) -> int:
-        """Number of contiguous storage elements spanned by *tensor*.
-
-        For a standard contiguous tensor this equals ``numel()``.  For
-        broadcast/expanded tensors (stride 0) this is much smaller — only
-        the physically stored elements are counted.
-        """
-        if tensor.numel() == 0:
-            return 0
-        span = 1
-        for s, st in zip(tensor.shape, tensor.stride()):
-            if s > 1:
-                span += (s - 1) * st
-        return span
-
-    def _make_pool_entry(self, tensor: torch.Tensor) -> Dict[str, Any]:
-        # Negative strides (e.g. from flip()) make storage span math
-        # ambiguous — materialise to contiguous up front.
-        if any(st < 0 for st in tensor.stride()):
-            tensor = tensor.contiguous()
-
+    def _make_pool_entry(
+        self, tensor: torch.Tensor, min_numel: int = 0
+    ) -> Dict[str, Any]:
         shape = tuple(tensor.shape)
         strides = tensor.stride()
-        storage_span = self._storage_span(tensor)
+        storage_span = _storage_span_from_first_element(tensor)
         elem_size = tensor.element_size()
 
         block_numel = max(1, self._POOL_ALIGNMENT // elem_size)
 
-        pool_numel = storage_span + self._offset_blocks[-1] * block_numel
+        padding = self._offset_blocks[-1] * block_numel
+        pool_numel = max(storage_span + padding, min_numel)
         pool = torch.empty(pool_numel, dtype=tensor.dtype, device=tensor.device)
 
         return {
             "pool": pool,
+            "capacity": pool_numel - padding,
             "shape": shape,
             "strides": strides,
             "storage_span": storage_span,
@@ -735,23 +904,28 @@ class ShiftingMemoryPoolAllocator:
         inputs = self._inputs() if callable(self._inputs) else self._inputs
         if idx == 0 and callable(self._inputs):
             self._input_entries = [{} for _ in inputs]
-        for pos, (inp, entry) in enumerate(zip(inputs, self._input_entries, strict=True)):
+        for pos, (inp, entry) in enumerate(
+            zip(inputs, self._input_entries, strict=True)
+        ):
             if not isinstance(inp, torch.Tensor):
                 result.append(inp)
                 continue
 
-            if any(stride < 0 for stride in inp.stride()):
-                inp = inp.contiguous()
-            span = self._storage_span(inp)
-            if (
-                not entry or entry["storage_span"] < span
-                or entry["pool"].dtype != inp.dtype or entry["pool"].device != inp.device
-            ):
-                if entry:
-                    self._live_rebased_tensors.append(entry["pool"])
+            span = _storage_span_from_first_element(inp)
+            if not entry:
                 entry = self._input_entries[pos] = self._make_pool_entry(inp)
+            elif entry["pool"].dtype != inp.dtype or entry["pool"].device != inp.device:
+                raise ValueError(f"Timing input {pos} changed dtype or device")
+            elif span > entry["capacity"]:
+                old_pool = entry["pool"]
+                entry = self._input_entries[pos] = self._make_pool_entry(
+                    inp, 2 * old_pool.numel()
+                )
+                self._live_rebased_tensors.append(old_pool)
             start = block_offset * entry["block_numel"]
-            entry["pool"].narrow(0, start, span).copy_(inp.detach().as_strided((span,), (1,)))
+            entry["pool"].narrow(0, start, span).copy_(
+                inp.detach().as_strided((span,), (1,))
+            )
             shifted = _rebase_tensor_storage(
                 entry["pool"].as_strided(inp.shape, inp.stride(), start)
             )

@@ -119,10 +119,12 @@ from sol_execbench.core.bench.correctness import (  # noqa: E402
     set_seed,
 )
 from sol_execbench.core.bench.io import (  # noqa: E402
+    TimingInputCheck,
     allocate_outputs,
     gen_inputs,
     load_safetensors,
     normalize_outputs,
+    prepare_timing_inputs,
     timing_input_stream,
 )
 from sol_execbench.core.bench.reward_hack import (  # noqa: E402
@@ -185,8 +187,31 @@ if ref_fn is None:
     raise RuntimeError("Reference code does not define a top-level 'run' function")
 
 
+def _make_eval(
+    status,
+    device,
+    log_path,
+    *,
+    correctness=None,
+    performance=None,
+    extra_msg=None,
+    _factory=make_eval,
+):
+    parts = [p for p in (_clock_status_msg, extra_msg) if p]
+    return _factory(
+        status,
+        device,
+        log_path,
+        correctness=correctness,
+        performance=performance,
+        extra_msg="\n".join(parts) or None,
+    )
+
+
 def _audit_after_timing(generate, workload, resolved_axes):
     """Verify fresh results with warmed state, outside the measurement windows."""
+    verify = partial(_check_integrity, _integrity_snapshot.copy(), globals())
+    reject = partial(_make_eval, EvaluationStatus.REWARD_HACK, _device, None)
     call = partial(
         _call_and_collect_outputs,
         definition=definition,
@@ -203,7 +228,10 @@ def _audit_after_timing(generate, workload, resolved_axes):
             return _make_eval(
                 EvaluationStatus.INVALID_REFERENCE, _device, None, extra_msg=str(error)
             )
-        outputs = call(user_fn, inputs, _dps)
+        try:
+            outputs = call(user_fn, inputs, _dps)
+        finally:
+            verify()
         check_lazy_outputs(outputs)
         for out, ref in zip(outputs, expected, strict=True):
             if out.shape != ref.shape:
@@ -218,15 +246,17 @@ def _audit_after_timing(generate, workload, resolved_axes):
             if wrong:
                 return _make_eval(
                     EvaluationStatus.INCORRECT_NUMERICAL,
-                    _device, None, correctness=correctness, extra_msg=label,
+                    _device,
+                    None,
+                    correctness=correctness,
+                    extra_msg=label,
                 )
         return None
 
     try:
         changes = []
-        seed = f"{bench_config.seed}:{workload.uuid}:audit"
         generate_audit = partial(generate, audit_changes=changes)
-        inputs = timing_input_stream(generate_audit, seed, _device)()
+        inputs = timing_input_stream(generate_audit, _device)()
         failure = compare(inputs, "Post-timing fresh input mismatch")
         if failure is not None or not changes:
             return failure
@@ -234,12 +264,12 @@ def _audit_after_timing(generate, workload, resolved_axes):
             change()
         return compare(inputs, "Post-timing input refresh mismatch")
     except RewardHackDetected as error:
-        return _make_eval(
-            EvaluationStatus.REWARD_HACK, _device, None, extra_msg=str(error)
-        )
+        return reject(extra_msg=str(error))
     except Exception as error:
         return _make_eval(
-            EvaluationStatus.RUNTIME_ERROR, _device, None,
+            EvaluationStatus.RUNTIME_ERROR,
+            _device,
+            None,
             extra_msg=f"Post-timing audit: {error}",
         )
 
@@ -256,7 +286,10 @@ _CRITICAL_NAMES = [
     "check_eval_integrity",
     "_call_and_collect_outputs",
     "_audit_after_timing",
+    "_make_eval",
     "gen_inputs",
+    "prepare_timing_inputs",
+    "TimingInputCheck",
     "timing_input_stream",
     "allocate_outputs",
     "normalize_outputs",
@@ -378,20 +411,6 @@ if bench_config.lock_clocks:
     _clock_status_msg = "Clocks locked: yes" if _clocks_locked else "Clocks locked: no"
 
 
-def _make_eval(
-    status, device, log_path, *, correctness=None, performance=None, extra_msg=None
-):
-    parts = [p for p in (_clock_status_msg, extra_msg) if p]
-    return make_eval(
-        status,
-        device,
-        log_path,
-        correctness=correctness,
-        performance=performance,
-        extra_msg="\n".join(parts) or None,
-    )
-
-
 # ── Integrity check after user code import ───────────────────────────────────
 # Catches patches applied at import time (e.g. via sys.modules['__main__']).
 # Runs once before any workload processing so patched correctness or timing
@@ -447,7 +466,7 @@ for _workload in workloads:
     _inputs = None
     _ref_outputs = None
     _user_outputs = None
-    _timing_outputs = None
+    _timing_outputs = _user_timing_inputs = _ref_timing_inputs = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -480,17 +499,22 @@ for _workload in workloads:
     # defense snapshots run on round 0 only; numerical checks run every round.
     _custom_inputs_fn = ref_namespace.get(definition.custom_inputs_entrypoint)
     _generate = partial(
-        gen_inputs, definition, _workload, device=_device,
-        safe_tensors=_safe_tensors or None, custom_inputs_fn=_custom_inputs_fn,
+        gen_inputs,
+        definition,
+        _workload,
+        device=_device,
+        safe_tensors=_safe_tensors or None,
+        custom_inputs_fn=_custom_inputs_fn,
     )
     _correctness_failed = False
+    _input_check = TimingInputCheck(definition, _workload)
     _threads_before = None
     _correctness = Correctness()
 
     for _round in range(10):
         # -- Generate inputs --
         try:
-            _inputs = _generate()
+            _inputs = _input_check.observe(_generate())
         except Exception as _e:
             _emit(
                 Trace(
@@ -645,20 +669,24 @@ for _workload in workloads:
 
     # -- User latency measurement --
     _inputs = _ref_outputs = _user_outputs = _ref_out = _usr_out = None
-    _timing_seed = f"{bench_config.seed}:{_workload.uuid}:timing"
     try:
+        _user_timing_inputs, _ref_timing_inputs = prepare_timing_inputs(
+            definition, _workload, _generate, _device
+        )
+        _user_timing_inputs = _input_check.monitor(_user_timing_inputs)
         _timing_outputs = (
             allocate_outputs(definition, _resolved_axes, _device) if _dps else []
         )
         _sol_latency_ms = time_runnable(
             user_fn,
-            timing_input_stream(_generate, _timing_seed, _device),
+            _user_timing_inputs,
             _timing_outputs,
             _device,
             warmup=bench_config.warmup_runs,
             rep=bench_config.iterations,
             seed=bench_config.seed,
         )
+        _input_check.check()
     except Exception as _e:
         _emit(
             Trace(
@@ -666,7 +694,9 @@ for _workload in workloads:
                 solution=_solution_name,
                 workload=_workload,
                 evaluation=_make_eval(
-                    EvaluationStatus.RUNTIME_ERROR,
+                    EvaluationStatus.REWARD_HACK
+                    if isinstance(_e, RewardHackDetected)
+                    else EvaluationStatus.RUNTIME_ERROR,
                     _device,
                     None,
                     extra_msg=f"Timing failed: {_e}",
@@ -687,7 +717,7 @@ for _workload in workloads:
         try:
             _ref_latency_ms = time_runnable(
                 ref_fn,
-                timing_input_stream(_generate, _timing_seed, _device),
+                _ref_timing_inputs,
                 [],
                 _device,
                 warmup=bench_config.warmup_runs,
@@ -697,15 +727,17 @@ for _workload in workloads:
         except Exception:
             pass
 
-    _timing_outputs = None
+    _timing_outputs = _user_timing_inputs = _ref_timing_inputs = None
     if _reward_hack_check(_workload, _check_integrity, _integrity_snapshot, globals()):
         continue
     _audit_failure = _audit_after_timing(_generate, _workload, _resolved_axes)
     if _audit_failure is not None:
         _emit(
             Trace(
-                definition=definition.name, solution=_solution_name,
-                workload=_workload, evaluation=_audit_failure,
+                definition=definition.name,
+                solution=_solution_name,
+                workload=_workload,
+                evaluation=_audit_failure,
             )
         )
         continue

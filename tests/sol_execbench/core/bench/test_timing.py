@@ -94,12 +94,22 @@ class TestSummarizeStatistics:
 
 
 class TestCuptiTimingAttribution:
-    def test_fresh_inputs_use_isolated_windows_not_a_fixed_kernel_sequence(self, monkeypatch):
+    def test_fresh_inputs_use_isolated_windows_not_a_fixed_kernel_sequence(
+        self, monkeypatch, caplog
+    ):
         calls = []
-        activities = [self._kernel(name, index, start, end) for index, (name, start, end) in enumerate([
-            ("add", 60, 90), ("add", 110, 120), ("generate", 140, 190),
-            ("mul", 220, 240), ("reduce", 250, 270),
-        ])]
+        activities = [
+            self._kernel(name, index, start, end)
+            for index, (name, start, end) in enumerate(
+                [
+                    ("add", 60, 90),
+                    ("add", 110, 120),
+                    ("generate", 140, 190),
+                    ("mul", 220, 240),
+                    ("reduce", 250, 270),
+                ]
+            )
+        ]
 
         @contextmanager
         def collect(**kwargs):
@@ -115,13 +125,26 @@ class TestCuptiTimingAttribution:
         monkeypatch.setattr(timing_module.cupti, "get_timestamp", timestamp)
         monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
         measured = bench_gpu_time_with_cupti(
-            lambda args: calls.append("run"), setup=lambda: calls.append("generate"),
-            varying_inputs=True, cold_l2_cache=False, warmup=0, rep=2,
+            lambda args: calls.append("run"),
+            setup=lambda: calls.append("generate"),
+            varying_inputs=True,
+            cold_l2_cache=False,
+            warmup=0,
+            rep=2,
         )
         assert measured == pytest.approx([10e-6, 50e-6])
+        assert "GPU activity mix changed at timed iteration 1" in caplog.text
+        assert "mul" in caplog.text and "add" in caplog.text
         for index, call in enumerate(calls):
             if call == "generate":
-                assert calls[index:index + 6] == ["generate", "sync", "timestamp", "run", "sync", "timestamp"]
+                assert calls[index : index + 6] == [
+                    "generate",
+                    "sync",
+                    "timestamp",
+                    "run",
+                    "sync",
+                    "timestamp",
+                ]
 
     def test_reset_persisting_l2_cache_checks_runtime_result(self, monkeypatch):
         check_errors = []
@@ -136,6 +159,35 @@ class TestCuptiTimingAttribution:
         _reset_persisting_l2_cache()
 
         assert check_errors == [0]
+
+    def test_fresh_timing_warns_once_when_work_disappears_after_warmup(
+        self, monkeypatch, caplog
+    ):
+        discovery = [self._kernel("work", 1, 10, 20), self._kernel("copy", 2, 21, 30)]
+        timed = [self._kernel("copy", 3, 110, 130), self._kernel("copy", 4, 210, 230)]
+        self._mock_cupti(monkeypatch, discovery, timed, [100, 140, 200, 240])
+        calls = []
+        times = bench_gpu_time_with_cupti(
+            lambda: calls.append(True),
+            warmup=1,
+            rep=2,
+            varying_inputs=True,
+            cold_l2_cache=False,
+        )
+        assert len(calls) == 3
+        assert times == pytest.approx([20e-6, 20e-6])
+        assert caplog.text.count("GPU activity mix changed") == 1
+        assert "missing=[('work', 1)]" in caplog.text
+
+    def test_cuda_events_rejects_input_factory_before_setup(self):
+        with pytest.raises(ValueError, match="Callable timing inputs require CUPTI"):
+            time_runnable(
+                lambda: None,
+                lambda: pytest.fail("unexpected setup"),
+                [],
+                "cpu",
+                methodology="cuda_events",
+            )
 
     def test_reset_persisting_l2_cache_uses_requested_device(self, monkeypatch):
         devices = []

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import logging
 import statistics
 from collections.abc import Callable
 from typing import Any, Literal, Union
@@ -126,6 +127,8 @@ def bench_gpu_time_with_cupti(
     or non-default-stream work remains inside the attribution window. With
     varying inputs, drain setup first and time the actual activities of each
     call; legal data-dependent dispatch need not match a discovery sample.
+    Log the first change from the last warmup (or first timed call without
+    warmup), without silently dropping activities from a different branch.
     """
     if setup is None:
         _fn = fn
@@ -154,13 +157,15 @@ def bench_gpu_time_with_cupti(
         return args
 
     torch.cuda.synchronize()
-    for _ in range(warmup):
+    profile_last_warmup = varying_inputs and warmup > 0
+    for _ in range(warmup - int(profile_last_warmup)):
         args = prepare_iteration()
         runner(args)
     torch.cuda.synchronize()
 
     # Discover the user-call GPU activity sequence after setup/cache work drains.
-    if not varying_inputs:
+    expected_kernel_counts = None
+    if not varying_inputs or profile_last_warmup:
         args = prepare_iteration()
         with collect_cupti_activities(
             activity_kinds=GPU_TIMING_ACTIVITY_KINDS
@@ -172,7 +177,7 @@ def bench_gpu_time_with_cupti(
             key=lambda kernel: (kernel.start, kernel.end, kernel.correlation_id),
         )
         expected_kernel_names = kernel_activity_sequence(expected_kernels)
-        if not expected_kernel_names:
+        if not expected_kernel_names and not varying_inputs:
             raise ValueError("No kernel activities recorded during discovery iteration")
         expected_kernel_counts = kernel_activity_counts(expected_kernels)
 
@@ -196,6 +201,7 @@ def bench_gpu_time_with_cupti(
     )
     kernel_starts = [kernel.start for kernel in sorted_kernels]
     measured_times = []
+    variation_reported = False
     for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
         left_idx = bisect.bisect_left(kernel_starts, start_cpu)
         right_idx = bisect.bisect_right(kernel_starts, end_cpu)
@@ -204,6 +210,19 @@ def bench_gpu_time_with_cupti(
             if not window_kernels:
                 raise ValueError(f"No GPU activities recorded at iteration {idx}")
             iter_kernels = window_kernels
+            if not variation_reported:
+                counts = kernel_activity_counts(iter_kernels)
+                if expected_kernel_counts is None:
+                    expected_kernel_counts = counts
+                elif counts != expected_kernel_counts:
+                    logging.getLogger(__name__).warning(
+                        "GPU activity mix changed at timed iteration %d: added=%s, missing=%s; "
+                        "measuring the full window (data-dependent or unrelated work)",
+                        idx,
+                        (counts - expected_kernel_counts).most_common(3),
+                        (expected_kernel_counts - counts).most_common(3),
+                    )
+                    variation_reported = True
         else:
             iter_kernels = select_activity_sequence(
                 window_kernels,
@@ -309,7 +328,8 @@ def time_runnable(
     fn : callable
         The function to benchmark.  Receives unpacked arguments each iteration.
     inputs : list or callable
-        Fixed arguments, or a workload input factory called before every iteration.
+        Fixed arguments, or a workload input factory called before every iteration
+        (CUPTI only; generating inputs can synchronize the CUDA event launch queue).
     outputs : list
         Pre-allocated output tensors for DPS kernels (from
         :func:`allocate_outputs`), or an empty list for non-DPS kernels.
@@ -331,6 +351,10 @@ def time_runnable(
     float | list[float]
         Benchmark result(s) in milliseconds.
     """
+    if callable(inputs) and methodology == "cuda_events":
+        raise ValueError(
+            "Callable timing inputs require CUPTI; use fixed inputs for CUDA events"
+        )
     total_iterations = warmup + rep
     with torch.cuda.device(device):
         if methodology == "cuda_events":

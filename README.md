@@ -91,7 +91,7 @@ Pass `--config bench.json` to override evaluator defaults. All fields are option
 | `iterations` | int | `50` | Timing iterations averaged into the latency report |
 | `lock_clocks` | bool | `false` | Require GPU clocks to be locked (also exposed as `--lock-clocks`) |
 | `benchmark_reference` | bool | `false` | When `true`, also time the reference implementation to compute speedup. **Disabled by default** because the reference can be dramatically slower than the kernel (sometimes >1 h), which dominates total evaluation time. Enable when you need a speedup factor in the trace. |
-| `seed` | int | `200` | RNG seed for input generation |
+| `seed` | int | `200` | Seed for the initial correctness rounds and timing address shifts. Generated timing and post-timing audit samples use fresh randomness. |
 
 ### Evaluation Environment
 
