@@ -94,6 +94,35 @@ class TestSummarizeStatistics:
 
 
 class TestCuptiTimingAttribution:
+    def test_fresh_inputs_use_isolated_windows_not_a_fixed_kernel_sequence(self, monkeypatch):
+        calls = []
+        activities = [self._kernel(name, index, start, end) for index, (name, start, end) in enumerate([
+            ("add", 60, 90), ("add", 110, 120), ("generate", 140, 190),
+            ("mul", 220, 240), ("reduce", 250, 270),
+        ])]
+
+        @contextmanager
+        def collect(**kwargs):
+            yield SimpleNamespace(kernels=activities)
+
+        timestamps = iter([100, 130, 200, 280])
+
+        def timestamp():
+            calls.append("timestamp")
+            return next(timestamps)
+
+        monkeypatch.setattr(timing_module, "collect_cupti_activities", collect)
+        monkeypatch.setattr(timing_module.cupti, "get_timestamp", timestamp)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+        measured = bench_gpu_time_with_cupti(
+            lambda args: calls.append("run"), setup=lambda: calls.append("generate"),
+            varying_inputs=True, cold_l2_cache=False, warmup=0, rep=2,
+        )
+        assert measured == pytest.approx([10e-6, 50e-6])
+        for index, call in enumerate(calls):
+            if call == "generate":
+                assert calls[index:index + 6] == ["generate", "sync", "timestamp", "run", "sync", "timestamp"]
+
     def test_reset_persisting_l2_cache_checks_runtime_result(self, monkeypatch):
         check_errors = []
 

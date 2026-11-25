@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import random
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -265,6 +266,8 @@ def _generate_heuristic_tensor(
     dtype: torch.dtype,
     device: torch.device,
     description: Optional[str] = None,
+    *,
+    audit_changes: list[Callable[[], Any]] | None = None,
 ) -> Optional[torch.Tensor]:
     """Generate a tensor using heuristics based on the input name.
 
@@ -279,10 +282,16 @@ def _generate_heuristic_tensor(
         return None
 
     if _is_norm_weight(name):
-        return torch.ones(shape, dtype=dtype, device=device)
+        weight = torch.ones(shape, dtype=dtype, device=device)
+        if audit_changes is not None and weight.numel():
+            audit_changes.append(lambda: weight.view(-1)[::2].fill_(0.5))
+        return weight
 
     if _is_norm_bias(name):
-        return torch.zeros(shape, dtype=dtype, device=device)
+        bias = torch.zeros(shape, dtype=dtype, device=device)
+        if audit_changes is not None and bias.numel():
+            audit_changes.append(lambda: bias.view(-1)[::2].fill_(0.25))
+        return bias
 
     if _is_causal_attention_mask(name, shape, description):
         seq_len = shape[-1]
@@ -291,10 +300,15 @@ def _generate_heuristic_tensor(
             torch.ones(seq_len, seq_len, device=device), diagonal=1
         ).bool()
         mask[..., causal] = torch.finfo(dtype).min
+        if audit_changes is not None and seq_len > 1:
+            audit_changes.append(lambda: mask[..., 1::4].fill_(torch.finfo(dtype).min))
         return mask
 
     if _is_binary_mask(name, description):
-        return torch.randint(0, 2, shape, device=device).to(dtype)
+        mask = torch.randint(0, 2, shape, device=device).to(dtype)
+        if audit_changes is not None and mask.numel():
+            audit_changes.append(lambda: mask.view(-1)[::2].fill_(1))
+        return mask
 
     if _is_rope_cos_sin(name):
         t = torch.randn(shape, dtype=torch.float32, device=device).clamp_(
@@ -325,7 +339,11 @@ def _generate_heuristic_tensor(
 
     if _is_weight_matrix(name, shape):
         fan_in = shape[-1]
-        return torch.randn(shape, dtype=dtype, device=device) / math.sqrt(fan_in)
+        weight = torch.randn(shape, dtype=dtype, device=device) / math.sqrt(fan_in)
+        if audit_changes is not None and weight.numel() >= 4:
+            quarter = weight.numel() // 4
+            audit_changes.append(lambda: weight.view(-1).narrow(0, quarter, 2 * quarter).neg_())
+        return weight
 
     return None
 
@@ -415,6 +433,8 @@ def gen_inputs(
     device: str,
     safe_tensors: Optional[Dict[str, torch.Tensor]] = None,
     custom_inputs_fn: Optional[Any] = None,
+    *,
+    audit_changes: list[Callable[[], Any]] | None = None,
 ) -> List[Any]:
     """Generate input tensors in definition order.
 
@@ -424,6 +444,9 @@ def gen_inputs(
     custom_inputs_fn: if provided, called each invocation to regenerate
         custom tensors instead of reusing *custom_tensors*.  Signature:
         ``(axes_and_scalars: dict, device: torch.device) -> dict[str, Tensor]``.
+    audit_changes: when supplied, collect in-place variations of generated
+        random inputs for a second correctness check. Never alter fixtures,
+        custom inputs or explicit workload scalars.
     """
     shapes = definition.get_input_shapes(workload.axes)
     dev = torch.device(device)
@@ -469,7 +492,8 @@ def gen_inputs(
                 value = _rand_tensor((), dtype, dev).item()
             else:
                 value = _generate_heuristic_tensor(
-                    name, tuple(shape), dtype, dev, spec.description
+                    name, tuple(shape), dtype, dev, spec.description,
+                    audit_changes=audit_changes,
                 )
                 if value is None:
                     value = _rand_tensor(shape, dtype, dev)
@@ -479,6 +503,31 @@ def gen_inputs(
 
             out.append(value)
     return out
+
+
+def timing_input_stream(
+    generate: Callable[[], list], seed: str, device: str
+) -> Callable[[], list]:
+    """Replay the same fresh workload samples for solution and reference timing."""
+    seeds = random.Random(seed)
+    dev = torch.device(device)
+    devices = [dev] if dev.type == "cuda" else []
+
+    def next_inputs():
+        sample_seed = seeds.getrandbits(63)
+        python_state = random.getstate()
+        try:
+            with torch.random.fork_rng(devices=devices):
+                random.seed(sample_seed)
+                torch.default_generator.manual_seed(sample_seed)
+                if devices:
+                    with torch.cuda.device(dev):
+                        torch.cuda.manual_seed(sample_seed)
+                return generate()
+        finally:
+            random.setstate(python_state)
+
+    return next_inputs
 
 
 # ── output generation ────────────────────────────────────────────────────────
@@ -560,10 +609,9 @@ class ShiftingMemoryPoolAllocator:
     """Pre-allocated memory pool that provides unique ``data_ptr`` per iteration.
 
     Allocates a buffer only slightly larger than the input tensors
-    (overhead ≈ ``total_iterations × 2048`` bytes per tensor).  The source
-    data is retained and copied into an advancing offset of the pool on
-    each call to :meth:`get_unique_args`, so every iteration sees a
-    distinct ``data_ptr`` while VRAM usage stays near 1× input size.
+    (overhead ≈ ``total_iterations × 2048`` bytes per tensor). Each call
+    copies the current sample into an advancing offset of the pool without
+    retaining a full input batch per iteration.
 
     The advance is a seeded random multiple of ``_POOL_ALIGNMENT``. This
     removes the fixed-stride signal that a submission could use to detect the
@@ -575,10 +623,8 @@ class ShiftingMemoryPoolAllocator:
 
     Parameters
     ----------
-    inputs : list[Any]
-        Initial input values (tensors and scalars) as returned by
-        :func:`gen_inputs`.  Tensor data is stored as the copy source;
-        scalars are returned as-is on every call.
+    inputs : list[Any] or callable
+        Fixed values or a factory supplying the current iteration's values.
     outputs : list[torch.Tensor]
         Output tensors for destination-passing-style kernels, as returned
         by :func:`allocate_outputs`.  These are zero-filled at each offset
@@ -596,24 +642,24 @@ class ShiftingMemoryPoolAllocator:
 
     def __init__(
         self,
-        inputs: List[Any],
+        inputs: List[Any] | Callable[[], List[Any]],
         outputs: List[torch.Tensor],
         total_iterations: int,
         seed: int = 0,
     ) -> None:
         self._call_idx = 0
         self._total_iterations = total_iterations
+        self._inputs = inputs
         self._input_entries: List[Dict[str, Any]] = []
         self._output_entries: List[Dict[str, Any]] = []
         self._live_rebased_tensors: List[torch.Tensor] = []
         self._offset_blocks = self._compute_offset_blocks(total_iterations, seed)
 
-        for inp in inputs:
-            if not isinstance(inp, torch.Tensor):
-                self._input_entries.append({"scalar": inp})
-                continue
-
-            self._input_entries.append(self._make_pool_entry(inp))
+        if not callable(inputs):
+            self._input_entries = [
+                self._make_pool_entry(inp) if isinstance(inp, torch.Tensor) else {}
+                for inp in inputs
+            ]
 
         for out in outputs:
             self._output_entries.append(self._make_pool_entry(out))
@@ -660,12 +706,8 @@ class ShiftingMemoryPoolAllocator:
         pool_numel = storage_span + self._offset_blocks[-1] * block_numel
         pool = torch.empty(pool_numel, dtype=tensor.dtype, device=tensor.device)
 
-        # Flat 1D view of the physical storage this tensor spans.
-        source = tensor.as_strided((storage_span,), (1,))
-
         return {
             "pool": pool,
-            "source": source,
             "shape": shape,
             "strides": strides,
             "storage_span": storage_span,
@@ -690,15 +732,28 @@ class ShiftingMemoryPoolAllocator:
         idx = self._call_idx
         block_offset = self._offset_blocks[idx]
 
-        for entry in self._input_entries:
-            if "scalar" in entry:
-                result.append(entry["scalar"])
+        inputs = self._inputs() if callable(self._inputs) else self._inputs
+        if idx == 0 and callable(self._inputs):
+            self._input_entries = [{} for _ in inputs]
+        for pos, (inp, entry) in enumerate(zip(inputs, self._input_entries, strict=True)):
+            if not isinstance(inp, torch.Tensor):
+                result.append(inp)
                 continue
 
+            if any(stride < 0 for stride in inp.stride()):
+                inp = inp.contiguous()
+            span = self._storage_span(inp)
+            if (
+                not entry or entry["storage_span"] < span
+                or entry["pool"].dtype != inp.dtype or entry["pool"].device != inp.device
+            ):
+                if entry:
+                    self._live_rebased_tensors.append(entry["pool"])
+                entry = self._input_entries[pos] = self._make_pool_entry(inp)
             start = block_offset * entry["block_numel"]
-            entry["pool"].narrow(0, start, entry["storage_span"]).copy_(entry["source"])
+            entry["pool"].narrow(0, start, span).copy_(inp.detach().as_strided((span,), (1,)))
             shifted = _rebase_tensor_storage(
-                entry["pool"].as_strided(entry["shape"], entry["strides"], start)
+                entry["pool"].as_strided(inp.shape, inp.stride(), start)
             )
             self._live_rebased_tensors.append(shifted)
             result.append(shifted)

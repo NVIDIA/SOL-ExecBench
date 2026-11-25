@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import random
 import warnings
 from pathlib import Path
 
@@ -39,8 +40,23 @@ from sol_execbench.core.bench.io import (
     gen_inputs,
     load_safetensors,
     normalize_outputs,
+    timing_input_stream,
 )
 from sol_execbench.core.data import Definition, Workload
+
+
+def test_timing_input_stream_is_replayable_and_preserves_caller_rng():
+    def generate():
+        return [random.random(), torch.rand(()).item()]
+
+    py_state, torch_state = random.getstate(), torch.get_rng_state()
+    user = timing_input_stream(generate, "200:sample:timing", "cpu")
+    reference = timing_input_stream(generate, "200:sample:timing", "cpu")
+    samples = [user() for _ in range(3)]
+    assert len({tuple(sample) for sample in samples}) == 3
+    assert samples == [reference() for _ in range(3)]
+    assert random.getstate() == py_state
+    assert torch.equal(torch.get_rng_state(), torch_state)
 
 # ------------------------------------------------------------------
 # _rand_tensor
@@ -251,6 +267,34 @@ class TestIsSoftmaxOutput:
 
 
 class TestGenerateHeuristicTensor:
+    def test_audit_changes_preserve_generated_input_domains(self):
+        changes = []
+
+        def generate(name, shape):
+            return _generate_heuristic_tensor(
+                name, shape, torch.float32, torch.device("cpu"), audit_changes=changes
+            )
+
+        weight = generate("weight", (4, 8))
+        original = weight.clone()
+        scale = generate("norm_weight", (8,))
+        bias = generate("norm_bias", (8,))
+        causal = generate("attention_mask", (8, 8))
+        binary = generate("x_mask", (8,))
+        generate("probs", (8,))
+        generate("x", (8,))
+        assert len(changes) == 5
+        for change in changes:
+            change()
+        assert torch.equal(weight[1:3], -original[1:3])
+        assert torch.equal(weight[::3], original[::3])
+        assert torch.all(scale[::2] == 0.5) and torch.all(scale[1::2] == 1)
+        assert torch.all(bias[::2] == 0.25) and torch.all(bias[1::2] == 0)
+        assert torch.all(causal[:, 0] == 0)
+        assert torch.all(causal[:, 1] == torch.finfo(causal.dtype).min)
+        assert torch.all(causal[torch.triu(torch.ones_like(causal), diagonal=1).bool()] < 0)
+        assert torch.all(binary[::2] == 1) and torch.all((binary == 0) | (binary == 1))
+
     def test_norm_weight_ones(self):
         t = _generate_heuristic_tensor(
             "norm_weight", (128,), torch.float32, torch.device("cpu")
@@ -567,6 +611,20 @@ class TestShiftingMemoryPoolAllocator:
             assert args[1] == 42
             assert args[2] == 3.14
             assert args[3] == "hello"
+
+    def test_factory_refreshes_tensor_values_layout_and_scalars(self):
+        samples = [torch.arange(3).expand(2, 3), torch.arange(6, 12).reshape(3, 2).T]
+        batches = iter([[sample, pos] for pos, sample in enumerate(samples)])
+        allocator = ShiftingMemoryPoolAllocator(lambda: next(batches), [torch.ones(2)], 2)
+        pointers = []
+        for pos, sample in enumerate(samples):
+            actual, scalar, output = allocator.get_unique_args()
+            assert torch.equal(actual, sample) and actual.stride() == sample.stride()
+            assert actual.storage_offset() == 0 and scalar == pos
+            pointers.append(actual.data_ptr())
+            assert torch.equal(output, torch.zeros(2))
+            output.fill_(1)
+        assert pointers[0] != pointers[1]
 
     def test_outputs_zero_filled(self):
         """DPS output tensors are zero-filled on every call."""

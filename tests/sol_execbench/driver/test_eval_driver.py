@@ -127,7 +127,9 @@ def _run_eval_driver(
     (tmp_path / "definition.json").write_text(
         json.dumps(definition if definition is not None else _MINIMAL_DEFINITION)
     )
-    (tmp_path / "workload.jsonl").write_text(json.dumps(_MINIMAL_WORKLOAD))
+    workload_path = tmp_path / "workload.jsonl"
+    if not workload_path.exists():
+        workload_path.write_text(json.dumps(_MINIMAL_WORKLOAD))
     (tmp_path / "solution.json").write_text(json.dumps(_SOLUTION_SPEC))
     (tmp_path / "kernel.py").write_text(kernel_code)
 
@@ -178,6 +180,39 @@ def test_passing_solution(tmp_path):
     assert ev["status"] == "PASSED", (
         f"Expected PASSED, got {ev['status']}; log={ev.get('log')}"
     )
+
+
+@pytest.mark.xdist_group("serial")
+def test_driver_replays_fresh_inputs_and_checks_weight_refresh(tmp_path):
+    kernel = (
+        "def run(x, weight):\n"
+        "    with open(LOG, 'a') as log: print(x[0].item(), weight[0,0].item(), weight[32,0].item(), file=log)\n"
+        "    return x @ weight\n"
+    )
+    definition = {
+        **_MINIMAL_DEFINITION,
+        "inputs": {
+            "x": {"shape": ["n"], "dtype": "float32"},
+            "weight": {"shape": ["n", "n"], "dtype": "float32"},
+        },
+        "reference": kernel.replace("LOG", "'ref.samples'"),
+    }
+    (tmp_path / "workload.jsonl").write_text(json.dumps({
+        **_MINIMAL_WORKLOAD, "inputs": dict.fromkeys(definition["inputs"], {"type": "random"}),
+    }))
+    traces = _run_eval_driver(
+        tmp_path, kernel.replace("LOG", "'user.samples'"), definition=definition,
+        bench_config={"warmup_runs": 1, "iterations": 2, "benchmark_reference": True},
+    )
+    evaluation = traces[0]["evaluation"]
+    assert evaluation["status"] == "PASSED", evaluation["log"]
+    assert evaluation["performance"]["reference_latency_ms"] > 0
+    reference = (tmp_path / "ref.samples").read_text().splitlines()
+    assert (tmp_path / "user.samples").read_text().splitlines() == reference
+    assert len(reference) == len(set(reference)) == 10 + 1 + 2 + 2
+    fresh, changed = (list(map(float, line.split())) for line in reference[-2:])
+    assert fresh[:2] == changed[:2]
+    assert fresh[2] == -changed[2] != 0
 
 
 def test_monkey_patch_detected(tmp_path):
