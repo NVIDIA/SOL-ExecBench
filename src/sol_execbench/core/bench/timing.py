@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import logging
 import statistics
 from collections.abc import Callable
 from typing import Any, Literal, Union
@@ -116,13 +117,18 @@ def bench_gpu_time_with_cupti(
     setup: Callable[[], Any] | None = None,
     cold_l2_cache: bool = True,
     device="cuda",
+    varying_inputs: bool = False,
 ):
-    """Benchmark GPU time using the discovered user CUPTI activity sequence.
+    """Benchmark GPU time using CUPTI activity windows.
 
     Setup and cache-management work is excluded by discovering the user-call
     sequence after warmup, then selecting only that sequence from every timed
     iteration. The end timestamp is captured after synchronization so delayed
-    or non-default-stream work remains inside the attribution window.
+    or non-default-stream work remains inside the attribution window. With
+    varying inputs, drain setup first and time the actual activities of each
+    call; legal data-dependent dispatch need not match a discovery sample.
+    Log the first change from the last warmup (or first timed call without
+    warmup), without silently dropping activities from a different branch.
     """
     if setup is None:
         _fn = fn
@@ -151,26 +157,29 @@ def bench_gpu_time_with_cupti(
         return args
 
     torch.cuda.synchronize()
-    for _ in range(warmup):
+    profile_last_warmup = varying_inputs and warmup > 0
+    for _ in range(warmup - int(profile_last_warmup)):
         args = prepare_iteration()
         runner(args)
     torch.cuda.synchronize()
 
     # Discover the user-call GPU activity sequence after setup/cache work drains.
-    args = prepare_iteration()
-    with collect_cupti_activities(
-        activity_kinds=GPU_TIMING_ACTIVITY_KINDS
-    ) as discovery_buffers:
-        runner(args)
-        torch.cuda.synchronize()
-    expected_kernels = sorted(
-        discovery_buffers.kernels,
-        key=lambda kernel: (kernel.start, kernel.end, kernel.correlation_id),
-    )
-    expected_kernel_names = kernel_activity_sequence(expected_kernels)
-    if not expected_kernel_names:
-        raise ValueError("No kernel activities recorded during discovery iteration")
-    expected_kernel_counts = kernel_activity_counts(expected_kernels)
+    expected_kernel_counts = None
+    if not varying_inputs or profile_last_warmup:
+        args = prepare_iteration()
+        with collect_cupti_activities(
+            activity_kinds=GPU_TIMING_ACTIVITY_KINDS
+        ) as discovery_buffers:
+            runner(args)
+            torch.cuda.synchronize()
+        expected_kernels = sorted(
+            discovery_buffers.kernels,
+            key=lambda kernel: (kernel.start, kernel.end, kernel.correlation_id),
+        )
+        expected_kernel_names = kernel_activity_sequence(expected_kernels)
+        if not expected_kernel_names and not varying_inputs:
+            raise ValueError("No kernel activities recorded during discovery iteration")
+        expected_kernel_counts = kernel_activity_counts(expected_kernels)
 
     iter_timestamps = []
     with collect_cupti_activities(
@@ -178,7 +187,7 @@ def bench_gpu_time_with_cupti(
     ) as cupti_buffers:
         torch.cuda.synchronize()
         for _ in range(rep):
-            args = prepare_iteration(synchronize=False)
+            args = prepare_iteration(synchronize=varying_inputs)
             start_cpu = cupti.get_timestamp()
             runner(args)
             torch.cuda.synchronize()
@@ -192,16 +201,35 @@ def bench_gpu_time_with_cupti(
     )
     kernel_starts = [kernel.start for kernel in sorted_kernels]
     measured_times = []
+    variation_reported = False
     for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
         left_idx = bisect.bisect_left(kernel_starts, start_cpu)
         right_idx = bisect.bisect_right(kernel_starts, end_cpu)
         window_kernels: list[CuptiKernelInfo] = sorted_kernels[left_idx:right_idx]
-        iter_kernels = select_activity_sequence(
-            window_kernels,
-            expected_kernel_names,
-            iteration=idx,
-        )
-        assert kernel_activity_counts(iter_kernels) == expected_kernel_counts
+        if varying_inputs:
+            if not window_kernels:
+                raise ValueError(f"No GPU activities recorded at iteration {idx}")
+            iter_kernels = window_kernels
+            if not variation_reported:
+                counts = kernel_activity_counts(iter_kernels)
+                if expected_kernel_counts is None:
+                    expected_kernel_counts = counts
+                elif counts != expected_kernel_counts:
+                    logging.getLogger(__name__).warning(
+                        "GPU activity mix changed at timed iteration %d: added=%s, missing=%s; "
+                        "measuring the full window (data-dependent or unrelated work)",
+                        idx,
+                        (counts - expected_kernel_counts).most_common(3),
+                        (expected_kernel_counts - counts).most_common(3),
+                    )
+                    variation_reported = True
+        else:
+            iter_kernels = select_activity_sequence(
+                window_kernels,
+                expected_kernel_names,
+                iteration=idx,
+            )
+            assert kernel_activity_counts(iter_kernels) == expected_kernel_counts
         min_start = min(k.start for k in iter_kernels)
         max_end = max(k.end for k in iter_kernels)
         measured_times.append((max_end - min_start) / 1e6)
@@ -280,7 +308,7 @@ def bench_time_with_cuda_events(
 
 def time_runnable(
     fn: Any,
-    inputs: list,
+    inputs: list | Callable[[], list],
     outputs: list,
     device: str,
     warmup: int = 10,
@@ -293,16 +321,15 @@ def time_runnable(
 
     Creates a :class:`ShiftingMemoryPoolAllocator` from *inputs* and *outputs*
     so each timed iteration receives arguments with a unique ``data_ptr``.
-    Allocator setup time is excluded from measurements. Crucially, the allocator
-    pre-allocates all tensors before the benchmark loop, so the timed region
-    is not affected by cudaMalloc times (which increase measured kernel time by 300%).
+    Input generation and pool setup run outside the measured region.
 
     Parameters
     ----------
     fn : callable
         The function to benchmark.  Receives unpacked arguments each iteration.
-    inputs : list
-        Input tensors/scalars as returned by :func:`gen_inputs`.
+    inputs : list or callable
+        Fixed arguments, or a workload input factory called before every iteration
+        (CUPTI only; generating inputs can synchronize the CUDA event launch queue).
     outputs : list
         Pre-allocated output tensors for DPS kernels (from
         :func:`allocate_outputs`), or an empty list for non-DPS kernels.
@@ -324,6 +351,10 @@ def time_runnable(
     float | list[float]
         Benchmark result(s) in milliseconds.
     """
+    if callable(inputs) and methodology == "cuda_events":
+        raise ValueError(
+            "Callable timing inputs require CUPTI; use fixed inputs for CUDA events"
+        )
     total_iterations = warmup + rep
     with torch.cuda.device(device):
         if methodology == "cuda_events":
@@ -342,7 +373,7 @@ def time_runnable(
                 del allocator
         elif methodology == "cupti":
             allocator = ShiftingMemoryPoolAllocator(
-                inputs, outputs, total_iterations + 1, seed=seed
+                inputs, outputs, total_iterations + int(not callable(inputs)), seed=seed
             )
             try:
                 times = bench_gpu_time_with_cupti(
@@ -351,6 +382,7 @@ def time_runnable(
                     rep=rep,
                     setup=allocator.get_unique_args,
                     device=device,
+                    varying_inputs=callable(inputs),
                 )
             finally:
                 del allocator

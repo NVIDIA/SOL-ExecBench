@@ -14,15 +14,18 @@
 # limitations under the License.
 
 import math
+import random
 import warnings
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
 import sol_execbench.core.bench.io as io_mod
 from sol_execbench.core.bench.io import (
     ShiftingMemoryPoolAllocator,
+    TimingInputCheck,
     _cast_to_fp4x2,
     _generate_heuristic_tensor,
     _is_binary_mask,
@@ -39,8 +42,67 @@ from sol_execbench.core.bench.io import (
     gen_inputs,
     load_safetensors,
     normalize_outputs,
+    prepare_timing_inputs,
+    timing_input_stream,
 )
+from sol_execbench.core.bench.reward_hack import RewardHackDetected
 from sol_execbench.core.data import Definition, Workload
+
+
+def test_timing_input_stream_is_replayable_and_preserves_caller_rng(monkeypatch):
+    def generate():
+        return [random.random(), np.random.random(), torch.rand(()).item()]
+
+    py_state, torch_state = random.getstate(), torch.get_rng_state()
+    numpy_state = np.random.get_state()
+    seeds = []
+    user = timing_input_stream(generate, "cpu", record=seeds)
+    reference = timing_input_stream(generate, "cpu", replay=iter(seeds))
+    assert not seeds
+    samples = [user() for _ in range(3)]
+    assert len(set(seeds)) == len(seeds) == 3
+    assert len({tuple(sample) for sample in samples}) == 3
+    with monkeypatch.context() as patch:
+        patch.setattr(io_mod, "urandom", None)
+        assert samples == [reference() for _ in range(3)]
+    with pytest.raises(StopIteration):
+        reference()
+    assert timing_input_stream(generate, "cpu")() not in samples
+    assert random.getstate() == py_state
+    np.testing.assert_equal(np.random.get_state(), numpy_state)
+    assert torch.equal(torch.get_rng_state(), torch_state)
+
+
+@pytest.mark.parametrize("replace_before_setup", [False, True])
+def test_fresh_sample_requires_original_entropy_source(
+    monkeypatch, replace_before_setup
+):
+    if replace_before_setup:
+        monkeypatch.setattr(io_mod, "urandom", None)
+    sample = timing_input_stream(
+        lambda: pytest.fail("unexpected input generation"), "cpu"
+    )
+    if not replace_before_setup:
+        monkeypatch.setattr(io_mod, "urandom", None)
+    with pytest.raises(RewardHackDetected, match="entropy source"):
+        sample()
+
+
+def test_duplicate_seed_is_never_delivered(monkeypatch):
+    draws = iter([2, 2, 4, 2, 4])
+
+    def entropy(size):
+        return next(draws).to_bytes(size, "little")
+
+    monkeypatch.setattr(io_mod, "urandom", entropy)
+    seeds = []
+    sample = timing_input_stream(list, "cpu", record=seeds, _entropy=entropy)
+    sample()
+    sample()
+    with pytest.raises(RuntimeError, match="duplicate seed"):
+        sample()
+    assert seeds == [1, 2]
+
 
 # ------------------------------------------------------------------
 # _rand_tensor
@@ -251,6 +313,51 @@ class TestIsSoftmaxOutput:
 
 
 class TestGenerateHeuristicTensor:
+    @pytest.mark.parametrize("bits", [[0, 0], [0, 1], [1, 0], [1, 1]])
+    def test_binary_mask_audit_always_changes_a_valid_pair(self, bits):
+        changes = []
+        mask = _generate_heuristic_tensor(
+            "drop_mask", (2,), torch.float32, torch.device("cpu"), audit_changes=changes
+        )
+        mask.copy_(torch.tensor(bits))
+        changes[0]()
+        assert mask.tolist() == [1 - bits[0], bits[0]]
+
+    def test_audit_changes_preserve_generated_input_domains(self):
+        changes = []
+
+        def generate(name, shape):
+            return _generate_heuristic_tensor(
+                name, shape, torch.float32, torch.device("cpu"), audit_changes=changes
+            )
+
+        weight = generate("weight", (4, 8))
+        original = weight.clone()
+        scale = generate("norm_weight", (8,))
+        bias = generate("norm_bias", (8,))
+        causal = generate("attention_mask", (8, 8))
+        binary = generate("drop_mask", (64, 8))
+        binary.fill_(1)
+        binary[::2].zero_()
+        generate("drop_mask", (64, 1))
+        generate("probs", (8,))
+        generate("x", (8,))
+        assert len(changes) == 5
+        for change in changes:
+            change()
+        assert torch.equal(weight[1:3], -original[1:3])
+        assert torch.equal(weight[::3], original[::3])
+        assert torch.all(scale[::2] == 0.5) and torch.all(scale[1::2] == 1)
+        assert torch.all(bias[::2] == 0.25) and torch.all(bias[1::2] == 0)
+        assert torch.all(causal[:, 0] == 0)
+        assert torch.all(causal[:, 1] == torch.finfo(causal.dtype).min)
+        assert torch.all(
+            causal[torch.triu(torch.ones_like(causal), diagonal=1).bool()] < 0
+        )
+        assert torch.all((binary == 0).any(dim=-1))
+        assert torch.all((binary == 1).any(dim=-1))
+        assert torch.all((binary == 0) | (binary == 1))
+
     def test_norm_weight_ones(self):
         t = _generate_heuristic_tensor(
             "norm_weight", (128,), torch.float32, torch.device("cpu")
@@ -568,6 +675,45 @@ class TestShiftingMemoryPoolAllocator:
             assert args[2] == 3.14
             assert args[3] == "hello"
 
+    def test_factory_refreshes_tensor_values_layout_and_scalars(self):
+        samples = [torch.arange(3).expand(2, 3), torch.arange(6, 12).reshape(3, 2).T]
+        batches = iter([[sample, pos] for pos, sample in enumerate(samples)])
+        allocator = ShiftingMemoryPoolAllocator(
+            lambda: next(batches), [torch.ones(2)], 2
+        )
+        pointers = []
+        for pos, sample in enumerate(samples):
+            actual, scalar, output = allocator.get_unique_args()
+            assert torch.equal(actual, sample) and actual.stride() == sample.stride()
+            assert actual.storage_offset() == 0 and scalar == pos
+            pointers.append(actual.data_ptr())
+            assert torch.equal(output, torch.zeros(2))
+            output.fill_(1)
+        assert pointers[0] != pointers[1]
+
+    def test_growing_factory_keeps_pool_memory_bounded(self):
+        sizes = range(4096, 8193, 64)
+        batches = ([torch.arange(size)] for size in sizes)
+        allocator = ShiftingMemoryPoolAllocator(lambda: next(batches), [], len(sizes))
+        capacities = {}
+        pointers = set()
+        for size in sizes:
+            (shifted,) = allocator.get_unique_args()
+            assert torch.equal(shifted, torch.arange(size))
+            pointers.add(shifted.data_ptr())
+            pool = allocator._input_entries[0]["pool"]
+            capacities[pool.data_ptr()] = pool.numel()
+        assert len(pointers) == len(sizes)
+        assert len(capacities) > 1
+        assert sum(capacities.values()) < 2 * max(capacities.values())
+
+    def test_factory_cannot_change_tensor_dtype(self):
+        batches = iter([[torch.zeros(1)], [torch.zeros(1, dtype=torch.int32)]])
+        allocator = ShiftingMemoryPoolAllocator(lambda: next(batches), [], 2)
+        allocator.get_unique_args()
+        with pytest.raises(ValueError, match="input 0 changed dtype or device"):
+            allocator.get_unique_args()
+
     def test_outputs_zero_filled(self):
         """DPS output tensors are zero-filled on every call."""
         inputs = [torch.randn(4)]
@@ -707,6 +853,163 @@ def _make_workload(**overrides):
     base = dict(uuid="test-uuid", axes={"N": 4}, inputs={"a": {"type": "random"}})
     base.update(overrides)
     return Workload(**base)
+
+
+@pytest.mark.parametrize(
+    ("values", "rejected"),
+    [
+        pytest.param([0] * 4, True, id="frozen"),
+        pytest.param([0, 1] * 5, True, id="alternating"),
+        pytest.param([0, 1, 2, 0, 2, 1, 1, 0, 2, 1], True, id="unordered-reuse"),
+        pytest.param(list(range(12)) * 5, True, id="long-cycle"),
+        pytest.param([*range(60), 0, 0, 0, 0], True, id="late-freeze"),
+        pytest.param([*range(8), 1, 3], True, id="eight-of-ten-distinct"),
+        pytest.param([*range(9), 4], False, id="nine-of-ten-distinct"),
+        pytest.param([0, 0, 0], False, id="too-few-samples"),
+        pytest.param(
+            random.Random(1).choices(range(32), k=100), False, id="small-domain"
+        ),
+    ],
+)
+def test_timing_checks_actual_values_before_the_user_can_change_them(values, rejected):
+    check = TimingInputCheck(_make_definition(), _make_workload())
+    tensor = torch.zeros(3, 64).T
+    for value in range(10):
+        tensor[0, 0] = value
+        check.observe([tensor])
+    draw = check.monitor(lambda: [tensor])
+    for value in values:
+        tensor[0, 0] = value
+        assert draw()[0] is tensor
+        tensor[0, 0] = -1
+    if rejected:
+        with pytest.raises(RewardHackDetected, match="Timing input 'a'"):
+            check.check()
+    else:
+        check.check()
+
+
+@pytest.mark.parametrize(
+    ("draws", "rejected"),
+    [
+        pytest.param(range(10, 70), False, id="all-fresh"),
+        pytest.param([*range(10, 69), 10], True, id="single-repeat"),
+        pytest.param([10, 10], True, id="short-run"),
+        pytest.param([3], True, id="correctness-replay"),
+        pytest.param(random.Random(1).choices(range(10, 20), k=60), True, id="pool"),
+    ],
+)
+def test_wide_timing_input_checks_each_draw(draws, rejected):
+    check = TimingInputCheck(_make_definition(), _make_workload())
+    samples = torch.randn(70, 16, generator=torch.Generator().manual_seed(123))
+    for sample in samples[:10]:
+        check.observe([sample])
+    indices = iter(draws)
+    draw = check.monitor(lambda: [samples[next(indices)]])
+    for _ in draws:
+        draw()
+    if rejected:
+        with pytest.raises(RewardHackDetected, match="Timing input 'a'"):
+            check.check()
+    else:
+        check.check()
+
+
+@pytest.mark.parametrize("width", [1, 7, 8])
+def test_wide_probe_counts_element_locations_not_bytes(width):
+    check = TimingInputCheck(_make_definition(), _make_workload())
+    for value in range(10):
+        tensor = torch.full((width,), value * 0x0101010101010101, dtype=torch.int64)
+        if width == 1:
+            tensor = tensor.expand(16)
+        check.observe([tensor])
+    draw = check.monitor(lambda: [tensor])
+    draw()
+    if width == 8:
+        with pytest.raises(RewardHackDetected, match="1 reused from correctness"):
+            check.check()
+    else:
+        check.check()
+
+
+def test_timing_allows_changing_probe_layout():
+    check = TimingInputCheck(_make_definition(), _make_workload())
+    for value in range(10):
+        check.observe([torch.arange(16) + value])
+    inputs = iter([torch.zeros(1).expand(16), torch.zeros(16)])
+    draw = check.monitor(lambda: [next(inputs)])
+    draw()
+    draw()
+    check.check()
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        None,
+        {"type": "custom"},
+        {"type": "scalar", "value": 7},
+        {"type": "safetensors", "path": "data", "tensor_key": "a"},
+    ],
+)
+def test_timing_allows_legitimate_repeated_values(spec):
+    workload = _make_workload(inputs={"a": spec} if spec else {})
+    check = TimingInputCheck(_make_definition(), workload)
+    for value in range(10):
+        check.observe([value if spec else value % 2])
+
+    def factory():
+        return [0]
+
+    assert check.monitor(factory) is factory
+    check.check()
+
+
+def test_value_check_samples_large_packed_views_without_materializing_them():
+    check = TimingInputCheck(_make_definition(), _make_workload())
+    data = torch.zeros(1, dtype=torch.uint8)
+    view = data.view(torch.float4_e2m1fn_x2).expand(1024, 1024)
+    for value in range(10):
+        data.fill_(value)
+        check.observe([view])
+    draw = check.monitor(lambda: [view])
+    for _ in range(4):
+        draw()
+    with pytest.raises(RewardHackDetected, match="Timing input 'a'"):
+        check.check()
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"type": "scalar", "value": 1.0},
+        {"type": "safetensors", "path": "inputs.safetensors", "tensor_key": "a"},
+    ],
+)
+def test_fixed_workload_passes_lists_to_cupti_discovery(spec):
+    inputs = [torch.ones(4)]
+    user, reference = prepare_timing_inputs(
+        _make_definition(), _make_workload(inputs={"a": spec}), lambda: inputs, "cpu"
+    )
+    assert user is reference is inputs
+
+
+@pytest.mark.parametrize(
+    "inputs", [{}, {"a": {"type": "random"}}, {"a": {"type": "custom"}}]
+)
+def test_generated_workload_replays_only_its_own_run(inputs):
+    def run():
+        user, reference = prepare_timing_inputs(
+            _make_definition(),
+            _make_workload(inputs=inputs),
+            lambda: [random.random()],
+            "cpu",
+        )
+        samples = [user() for _ in range(3)]
+        assert samples == [reference() for _ in range(3)]
+        return samples
+
+    assert run() != run()
 
 
 # ------------------------------------------------------------------

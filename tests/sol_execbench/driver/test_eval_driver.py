@@ -30,10 +30,14 @@ from __future__ import annotations
 import ast
 import json
 import os
+import runpy
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import Mock
 
 import pytest
 
@@ -127,7 +131,9 @@ def _run_eval_driver(
     (tmp_path / "definition.json").write_text(
         json.dumps(definition if definition is not None else _MINIMAL_DEFINITION)
     )
-    (tmp_path / "workload.jsonl").write_text(json.dumps(_MINIMAL_WORKLOAD))
+    workload_path = tmp_path / "workload.jsonl"
+    if not workload_path.exists():
+        workload_path.write_text(json.dumps(_MINIMAL_WORKLOAD))
     (tmp_path / "solution.json").write_text(json.dumps(_SOLUTION_SPEC))
     (tmp_path / "kernel.py").write_text(kernel_code)
 
@@ -167,6 +173,64 @@ def test_eval_driver_is_valid_python():
     ast.parse(source, filename="eval_driver.py")
 
 
+@pytest.mark.parametrize("changed_call", [1, 2])
+def test_audit_verifies_each_call_before_using_its_result(changed_call, tmp_path):
+    from sol_execbench.core import EvaluationStatus
+    from sol_execbench.core.bench.reward_hack import (
+        RewardHackDetected,
+        check_eval_integrity,
+    )
+
+    factory = Mock(side_effect=lambda status, *args, **kwargs: status)
+    check_outputs = Mock()
+    bindings = {
+        "make_eval": factory,
+        "_check_integrity": check_eval_integrity,
+        "_integrity_snapshot": {"make_eval": id(factory)},
+        "RewardHackDetected": RewardHackDetected,
+        "EvaluationStatus": EvaluationStatus,
+        "partial": partial,
+        "_clock_status_msg": None,
+        "_device": "cpu",
+        "_dps": False,
+        "definition": None,
+        "_output_names": [],
+        "_output_dtypes_torch": {},
+        "bench_config": SimpleNamespace(seed=0),
+        "ref_fn": list,
+        "check_lazy_outputs": check_outputs,
+        "_call_and_collect_outputs": lambda fn, *args, **kwargs: fn(),
+        "timing_input_stream": lambda generate, device: generate,
+    }
+    functions = ast.parse(build_driver())
+    functions.body = [
+        node
+        for node in functions.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_audit_after_timing", "_make_eval"}
+    ]
+    unit = tmp_path / "audit.py"
+    unit.write_text(ast.unparse(functions))
+    audit = runpy.run_path(str(unit), init_globals=bindings)["_audit_after_timing"]
+    namespace = audit.__globals__
+
+    def generate(audit_changes):
+        audit_changes.append(lambda: None)
+        return []
+
+    def user_call():
+        if user.call_count == changed_call:
+            namespace["make_eval"] = None
+        return []
+
+    user = namespace["user_fn"] = Mock(side_effect=user_call)
+    result = audit(generate, SimpleNamespace(uuid="audit"), {})
+    assert result == EvaluationStatus.REWARD_HACK
+    assert check_outputs.call_count == changed_call - 1
+    assert factory.call_args.args[0] == EvaluationStatus.REWARD_HACK
+    assert "make_eval" in factory.call_args.kwargs["extra_msg"]
+
+
 @pytest.mark.xdist_group("serial")
 def test_passing_solution(tmp_path):
     """A correct vector-add kernel produces a PASSED trace."""
@@ -178,6 +242,58 @@ def test_passing_solution(tmp_path):
     assert ev["status"] == "PASSED", (
         f"Expected PASSED, got {ev['status']}; log={ev.get('log')}"
     )
+
+
+@pytest.mark.xdist_group("serial")
+def test_driver_replays_fresh_inputs_and_checks_weight_refresh(tmp_path):
+    kernel = (
+        "def run(x, weight):\n"
+        "    with open(LOG, 'a') as log: print(x[0].item(), weight[0,0].item(), weight[32,0].item(), file=log)\n"
+        "    return x @ weight\n"
+    )
+    definition = {
+        **_MINIMAL_DEFINITION,
+        "inputs": {
+            "x": {"shape": ["n"], "dtype": "float32"},
+            "weight": {"shape": ["n", "n"], "dtype": "float32"},
+        },
+        "reference": kernel.replace("LOG", "'ref.samples'"),
+    }
+
+    def run(path):
+        path.mkdir()
+        (path / "workload.jsonl").write_text(
+            json.dumps(
+                {
+                    **_MINIMAL_WORKLOAD,
+                    "inputs": dict.fromkeys(definition["inputs"], {"type": "random"}),
+                }
+            )
+        )
+        traces = _run_eval_driver(
+            path,
+            kernel.replace("LOG", "'user.samples'"),
+            definition=definition,
+            bench_config={
+                "warmup_runs": 1,
+                "iterations": 2,
+                "benchmark_reference": True,
+            },
+        )
+        evaluation = traces[0]["evaluation"]
+        assert evaluation["status"] == "PASSED", evaluation["log"]
+        assert evaluation["performance"]["reference_latency_ms"] > 0
+        reference = (path / "ref.samples").read_text().splitlines()
+        assert (path / "user.samples").read_text().splitlines() == reference
+        assert len(reference) == len(set(reference)) == 10 + 1 + 2 + 2
+        fresh, changed = (list(map(float, line.split())) for line in reference[-2:])
+        assert fresh[:2] == changed[:2]
+        assert fresh[2] == -changed[2] != 0
+        return reference
+
+    first, second = run(tmp_path / "first"), run(tmp_path / "second")
+    assert first[:10] == second[:10]
+    assert set(first[10:]).isdisjoint(second[10:])
 
 
 def test_monkey_patch_detected(tmp_path):

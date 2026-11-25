@@ -32,6 +32,7 @@ import os
 import sys
 import threading
 import traceback
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -118,10 +119,13 @@ from sol_execbench.core.bench.correctness import (  # noqa: E402
     set_seed,
 )
 from sol_execbench.core.bench.io import (  # noqa: E402
+    TimingInputCheck,
     allocate_outputs,
     gen_inputs,
     load_safetensors,
     normalize_outputs,
+    prepare_timing_inputs,
+    timing_input_stream,
 )
 from sol_execbench.core.bench.reward_hack import (  # noqa: E402
     RewardHackDetected,
@@ -182,6 +186,94 @@ ref_fn = ref_namespace.get("run")
 if ref_fn is None:
     raise RuntimeError("Reference code does not define a top-level 'run' function")
 
+
+def _make_eval(
+    status,
+    device,
+    log_path,
+    *,
+    correctness=None,
+    performance=None,
+    extra_msg=None,
+    _factory=make_eval,
+):
+    parts = [p for p in (_clock_status_msg, extra_msg) if p]
+    return _factory(
+        status,
+        device,
+        log_path,
+        correctness=correctness,
+        performance=performance,
+        extra_msg="\n".join(parts) or None,
+    )
+
+
+def _audit_after_timing(generate, workload, resolved_axes):
+    """Verify fresh results with warmed state, outside the measurement windows."""
+    verify = partial(_check_integrity, _integrity_snapshot.copy(), globals())
+    reject = partial(_make_eval, EvaluationStatus.REWARD_HACK, _device, None)
+    call = partial(
+        _call_and_collect_outputs,
+        definition=definition,
+        resolved_axes=resolved_axes,
+        device=_device,
+        output_names=_output_names,
+        output_dtypes_torch=_output_dtypes_torch,
+    )
+
+    def compare(inputs, label):
+        try:
+            expected = call(ref_fn, inputs, False)
+        except Exception as error:
+            return _make_eval(
+                EvaluationStatus.INVALID_REFERENCE, _device, None, extra_msg=str(error)
+            )
+        try:
+            outputs = call(user_fn, inputs, _dps)
+        finally:
+            verify()
+        check_lazy_outputs(outputs)
+        for out, ref in zip(outputs, expected, strict=True):
+            if out.shape != ref.shape:
+                return _make_eval(
+                    EvaluationStatus.INCORRECT_SHAPE, _device, None, extra_msg=label
+                )
+            if out.dtype != ref.dtype:
+                return _make_eval(
+                    EvaluationStatus.INCORRECT_DTYPE, _device, None, extra_msg=label
+                )
+            correctness, wrong = compute_error_stats(out, ref, workload.tolerance)
+            if wrong:
+                return _make_eval(
+                    EvaluationStatus.INCORRECT_NUMERICAL,
+                    _device,
+                    None,
+                    correctness=correctness,
+                    extra_msg=label,
+                )
+        return None
+
+    try:
+        changes = []
+        generate_audit = partial(generate, audit_changes=changes)
+        inputs = timing_input_stream(generate_audit, _device)()
+        failure = compare(inputs, "Post-timing fresh input mismatch")
+        if failure is not None or not changes:
+            return failure
+        for change in changes:
+            change()
+        return compare(inputs, "Post-timing input refresh mismatch")
+    except RewardHackDetected as error:
+        return reject(extra_msg=str(error))
+    except Exception as error:
+        return _make_eval(
+            EvaluationStatus.RUNTIME_ERROR,
+            _device,
+            None,
+            extra_msg=f"Post-timing audit: {error}",
+        )
+
+
 # ── Integrity snapshot (before user code import) ─────────────────────────────
 # Capture id() of every function that affects measurement or correctness.
 # Checked after user code import and after each user_fn() call.
@@ -193,7 +285,12 @@ _CRITICAL_NAMES = [
     "check_thread_injection",
     "check_eval_integrity",
     "_call_and_collect_outputs",
+    "_audit_after_timing",
+    "_make_eval",
     "gen_inputs",
+    "prepare_timing_inputs",
+    "TimingInputCheck",
+    "timing_input_stream",
     "allocate_outputs",
     "normalize_outputs",
     "make_eval",
@@ -314,20 +411,6 @@ if bench_config.lock_clocks:
     _clock_status_msg = "Clocks locked: yes" if _clocks_locked else "Clocks locked: no"
 
 
-def _make_eval(
-    status, device, log_path, *, correctness=None, performance=None, extra_msg=None
-):
-    parts = [p for p in (_clock_status_msg, extra_msg) if p]
-    return make_eval(
-        status,
-        device,
-        log_path,
-        correctness=correctness,
-        performance=performance,
-        extra_msg="\n".join(parts) or None,
-    )
-
-
 # ── Integrity check after user code import ───────────────────────────────────
 # Catches patches applied at import time (e.g. via sys.modules['__main__']).
 # Runs once before any workload processing so patched correctness or timing
@@ -383,7 +466,7 @@ for _workload in workloads:
     _inputs = None
     _ref_outputs = None
     _user_outputs = None
-    _timing_outputs = None
+    _timing_outputs = _user_timing_inputs = _ref_timing_inputs = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -415,20 +498,23 @@ for _workload in workloads:
     # correctness issues.  Structural checks (lazy outputs, shape/dtype) and
     # defense snapshots run on round 0 only; numerical checks run every round.
     _custom_inputs_fn = ref_namespace.get(definition.custom_inputs_entrypoint)
+    _generate = partial(
+        gen_inputs,
+        definition,
+        _workload,
+        device=_device,
+        safe_tensors=_safe_tensors or None,
+        custom_inputs_fn=_custom_inputs_fn,
+    )
     _correctness_failed = False
+    _input_check = TimingInputCheck(definition, _workload)
     _threads_before = None
     _correctness = Correctness()
 
     for _round in range(10):
         # -- Generate inputs --
         try:
-            _inputs = gen_inputs(
-                definition,
-                _workload,
-                device=_device,
-                safe_tensors=_safe_tensors or None,
-                custom_inputs_fn=_custom_inputs_fn,
-            )
+            _inputs = _input_check.observe(_generate())
         except Exception as _e:
             _emit(
                 Trace(
@@ -582,19 +668,25 @@ for _workload in workloads:
         continue
 
     # -- User latency measurement --
+    _inputs = _ref_outputs = _user_outputs = _ref_out = _usr_out = None
     try:
+        _user_timing_inputs, _ref_timing_inputs = prepare_timing_inputs(
+            definition, _workload, _generate, _device
+        )
+        _user_timing_inputs = _input_check.monitor(_user_timing_inputs)
         _timing_outputs = (
             allocate_outputs(definition, _resolved_axes, _device) if _dps else []
         )
         _sol_latency_ms = time_runnable(
             user_fn,
-            _inputs,
+            _user_timing_inputs,
             _timing_outputs,
             _device,
             warmup=bench_config.warmup_runs,
             rep=bench_config.iterations,
             seed=bench_config.seed,
         )
+        _input_check.check()
     except Exception as _e:
         _emit(
             Trace(
@@ -602,7 +694,9 @@ for _workload in workloads:
                 solution=_solution_name,
                 workload=_workload,
                 evaluation=_make_eval(
-                    EvaluationStatus.RUNTIME_ERROR,
+                    EvaluationStatus.REWARD_HACK
+                    if isinstance(_e, RewardHackDetected)
+                    else EvaluationStatus.RUNTIME_ERROR,
                     _device,
                     None,
                     extra_msg=f"Timing failed: {_e}",
@@ -618,13 +712,12 @@ for _workload in workloads:
         continue
 
     # -- Reference latency (for speedup factor) —always return-value style --
-    # Inputs are cloned (not regenerated) since the reference cannot cheat.
     _ref_latency_ms = 0.0
     if bench_config.benchmark_reference:
         try:
             _ref_latency_ms = time_runnable(
                 ref_fn,
-                _inputs,
+                _ref_timing_inputs,
                 [],
                 _device,
                 warmup=bench_config.warmup_runs,
@@ -633,6 +726,21 @@ for _workload in workloads:
             )
         except Exception:
             pass
+
+    _timing_outputs = _user_timing_inputs = _ref_timing_inputs = None
+    if _reward_hack_check(_workload, _check_integrity, _integrity_snapshot, globals()):
+        continue
+    _audit_failure = _audit_after_timing(_generate, _workload, _resolved_axes)
+    if _audit_failure is not None:
+        _emit(
+            Trace(
+                definition=definition.name,
+                solution=_solution_name,
+                workload=_workload,
+                evaluation=_audit_failure,
+            )
+        )
+        continue
 
     _speedup = _ref_latency_ms / _sol_latency_ms if _sol_latency_ms > 0 else 0.0
 
