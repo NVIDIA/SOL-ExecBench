@@ -25,6 +25,7 @@ from sol_execbench.core import (
     BenchmarkConfig,
     Definition,
     Solution,
+    SourceFile,
     Trace,
     Workload,
 )
@@ -129,6 +130,13 @@ def _make_packager(
 
 
 class TestInit:
+    def test_solution_cannot_replace_problem_metadata(
+        self, tmp_path, definition, workloads, python_solution, config
+    ):
+        python_solution.sources.append(SourceFile(path="definition.json", content="{}"))
+        with pytest.raises(ValueError, match="conflicts with a staged evaluator file"):
+            _make_packager(tmp_path, definition, workloads, python_solution, config)
+
     def test_definition_json_written(
         self, tmp_path, definition, workloads, python_solution, config
     ):
@@ -244,7 +252,7 @@ class TestExecute:
     ):
         pkg = _make_packager(tmp_path, definition, workloads, python_solution, config)
         cmd = pkg.execute()
-        assert cmd == ["python", "eval_driver.py"]
+        assert cmd == ["python", "-E", "-P", "eval_driver.py"]
 
     def test_eval_driver_staged(
         self, tmp_path, definition, workloads, python_solution, config
@@ -269,7 +277,7 @@ class TestExecute:
         # Simulate a compiled artifact.
         (pkg.output_dir / "benchmark_kernel.so").write_bytes(b"\x00")
         cmd = pkg.execute()
-        assert cmd == ["python", "eval_driver.py"]
+        assert cmd == ["python", "-E", "-P", "eval_driver.py"]
 
 
 # ── convert_stdout_to_traces() ────────────────────────────────────────────────

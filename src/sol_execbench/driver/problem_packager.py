@@ -155,7 +155,20 @@ class ProblemPackager:
 
     def _write_sources(self) -> None:
         """Write solution source files to the staging directory."""
+        reserved = {
+            "definition.json",
+            "workload.jsonl",
+            "solution.json",
+            "config.json",
+            "build_ext.py",
+            "eval_driver.py",
+            "benchmark_kernel.so",
+        }
         for src in self.solution.sources:
+            if Path(src.path).parts[0] in reserved:
+                raise ValueError(
+                    f"Solution source conflicts with a staged evaluator file: {src.path}"
+                )
             dest = self.output_dir / src.path
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(src.content)
@@ -211,7 +224,7 @@ class ProblemPackager:
             (_TEMPLATES_DIR / "eval_driver.py").read_text()
         )
 
-        return ["python", "eval_driver.py"]
+        return ["python", "-E", "-P", "eval_driver.py"]
 
     def convert_stdout_to_traces(self, stdout: str) -> list[Trace]:
         """Parse JSONL stdout from eval_driver.py into Trace objects.

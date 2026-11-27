@@ -36,8 +36,11 @@ from pathlib import Path
 from typing import Optional
 
 import pytest
+import torch
 
 import sol_execbench.driver as _driver_pkg
+from sol_execbench.core.bench.reward_hack import RewardHackDetected
+from sol_execbench.driver.templates import eval_driver
 
 _TEMPLATES_DIR = Path(_driver_pkg.__file__).parent / "templates"
 
@@ -108,6 +111,7 @@ def _run_eval_driver(
     bench_config: Optional[dict] = None,
     extra_env: Optional[dict] = None,
     definition: Optional[dict] = None,
+    dps: bool = False,
 ) -> list[dict]:
     """Write all staging files and run eval_driver.py in a subprocess.
 
@@ -127,8 +131,14 @@ def _run_eval_driver(
     (tmp_path / "definition.json").write_text(
         json.dumps(definition if definition is not None else _MINIMAL_DEFINITION)
     )
-    (tmp_path / "workload.jsonl").write_text(json.dumps(_MINIMAL_WORKLOAD))
-    (tmp_path / "solution.json").write_text(json.dumps(_SOLUTION_SPEC))
+    workload_path = tmp_path / "workload.jsonl"
+    if not workload_path.exists():
+        workload_path.write_text(json.dumps(_MINIMAL_WORKLOAD))
+    solution = {
+        **_SOLUTION_SPEC,
+        "spec": {**_SOLUTION_SPEC["spec"], "destination_passing_style": dps},
+    }
+    (tmp_path / "solution.json").write_text(json.dumps(solution))
     (tmp_path / "kernel.py").write_text(kernel_code)
 
     # Default config: disable clock-locking (no nvidia-smi).
@@ -146,7 +156,7 @@ def _run_eval_driver(
         env.update(extra_env)
 
     result = subprocess.run(
-        [sys.executable, "eval_driver.py"],
+        [sys.executable, "-E", "-P", "eval_driver.py"],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -167,6 +177,18 @@ def test_eval_driver_is_valid_python():
     ast.parse(source, filename="eval_driver.py")
 
 
+def test_worker_rechecks_original_integrity_snapshot(monkeypatch):
+    guard = eval_driver._make_integrity_guard()
+    with guard():
+        pass
+    monkeypatch.delattr(eval_driver, "normalize_outputs")
+    entered = False
+    with pytest.raises(RewardHackDetected, match="normalize_outputs"):
+        with guard():
+            entered = True
+    assert not entered
+
+
 @pytest.mark.xdist_group("serial")
 def test_passing_solution(tmp_path):
     """A correct vector-add kernel produces a PASSED trace."""
@@ -178,6 +200,132 @@ def test_passing_solution(tmp_path):
     assert ev["status"] == "PASSED", (
         f"Expected PASSED, got {ev['status']}; log={ev.get('log')}"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA timing required")
+def test_submission_precision_is_graded_by_workload_tolerance(tmp_path):
+    workloads = [
+        {
+            **_MINIMAL_WORKLOAD,
+            "uuid": name,
+            "tolerance": {"max_atol": atol, "max_rtol": 0},
+        }
+        for name, atol in (("strict", 0.01), ("loose", 0.25))
+    ]
+    (tmp_path / "workload.jsonl").write_text("\n".join(map(json.dumps, workloads)))
+    kernel = (
+        "import torch\ntorch.set_float32_matmul_precision('high')\n"
+        "def run(x, y):\n    return x + y + 0.125"
+    )
+    traces = _run_eval_driver(tmp_path, kernel)
+    assert [trace["workload"]["uuid"] for trace in traces] == ["strict", "loose"]
+    strict, loose = (trace["evaluation"] for trace in traces)
+    assert strict["status"] == "INCORRECT_NUMERICAL", strict["log"]
+    assert strict["performance"] is None
+    assert loose["status"] == "PASSED", loose["log"]
+    assert loose["performance"]["latency_ms"] > 0
+
+
+def test_reference_and_judge_do_not_inherit_submission_defaults(tmp_path):
+    (tmp_path / "sitecustomize.py").write_text(
+        "from pathlib import Path\nPath('startup-hook').touch()\n"
+    )
+    reference = (
+        "import torch\ndef run(x, y):\n"
+        "    offset = (torch.tensor(16777216.) + 1.) - 16777216.\n"
+        "    return x + y + offset.item()"
+    )
+    kernel = (
+        "import torch\ntorch.set_default_dtype(torch.float64)\n"
+        "def run(x, y):\n    return x + y + 1.0"
+    )
+    traces = _run_eval_driver(
+        tmp_path,
+        kernel,
+        definition={**_MINIMAL_DEFINITION, "reference": reference},
+        extra_env={
+            "PYTHONPATH": os.pathsep.join(
+                [str(tmp_path), os.environ.get("PYTHONPATH", "")]
+            )
+        },
+    )
+    assert not (tmp_path / "startup-hook").exists()
+    (evaluation,) = (trace["evaluation"] for trace in traces)
+    assert evaluation["status"] == "INCORRECT_NUMERICAL"
+    assert evaluation["performance"] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA timing required")
+def test_reference_timing_uses_only_reference_process(tmp_path):
+    reference = (
+        "import os, torch\nfrom pathlib import Path\n"
+        "def run(x, y):\n"
+        "    assert str(os.getpid()) != Path('solution.pid').read_text()\n"
+        "    return x + y"
+    )
+    kernel = (
+        "import os\nfrom pathlib import Path\n"
+        "Path('solution.pid').write_text(str(os.getpid()))\n"
+        "def run(x, y, output):\n    output.copy_(x + y)"
+    )
+    traces = _run_eval_driver(
+        tmp_path,
+        kernel,
+        dps=True,
+        definition={**_MINIMAL_DEFINITION, "reference": reference},
+        bench_config={"benchmark_reference": True, "warmup_runs": 2, "iterations": 3},
+    )
+    (evaluation,) = (trace["evaluation"] for trace in traces)
+    assert evaluation["status"] == "PASSED", evaluation["log"]
+    assert evaluation["performance"]["reference_latency_ms"] > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA timing required")
+def test_optional_reference_timing_failure_keeps_user_score(tmp_path):
+    reference = (
+        "from pathlib import Path\ncalls = 0\n"
+        "def run(x, y):\n"
+        "    global calls\n    calls += 1\n"
+        "    if calls > 10:\n"
+        "        Path('reference-timed').touch()\n"
+        "        raise RuntimeError('reference timing unavailable')\n"
+        "    return x + y"
+    )
+    traces = _run_eval_driver(
+        tmp_path,
+        "def run(x, y):\n    return x + y",
+        definition={**_MINIMAL_DEFINITION, "reference": reference},
+        bench_config={"benchmark_reference": True, "warmup_runs": 2, "iterations": 3},
+    )
+    (evaluation,) = (trace["evaluation"] for trace in traces)
+    assert (tmp_path / "reference-timed").exists()
+    assert evaluation["status"] == "PASSED", evaluation["log"]
+    assert evaluation["performance"]["latency_ms"] > 0
+    assert evaluation["performance"]["reference_latency_ms"] == 0
+    assert evaluation["performance"]["speedup_factor"] == 0
+
+
+def test_worker_exit_leaves_no_partial_scores(tmp_path):
+    workloads = [{**_MINIMAL_WORKLOAD, "uuid": name} for name in ("first", "second")]
+    (tmp_path / "workload.jsonl").write_text("\n".join(map(json.dumps, workloads)))
+    traces = _run_eval_driver(tmp_path, "def run(x, y):\n    raise SystemExit(3)")
+    assert [trace["workload"]["uuid"] for trace in traces] == ["first", "second"]
+    assert all(
+        trace["evaluation"]["status"] == "RUNTIME_ERROR"
+        and trace["evaluation"]["performance"] is None
+        for trace in traces
+    )
+
+
+def test_reference_output_alias_is_not_a_worker_input(tmp_path):
+    traces = _run_eval_driver(
+        tmp_path,
+        "def run(x, y):\n    return x.zero_()",
+        definition={**_MINIMAL_DEFINITION, "reference": "def run(x, y):\n    return x"},
+    )
+    assert [trace["evaluation"]["status"] for trace in traces] == [
+        "INCORRECT_NUMERICAL"
+    ]
 
 
 def test_monkey_patch_detected(tmp_path):
@@ -370,7 +518,7 @@ def test_load_inline_blocked_at_import(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"lock_clocks": False}))
 
     result = subprocess.run(
-        [sys.executable, "eval_driver.py"],
+        [sys.executable, "-E", "-P", "eval_driver.py"],
         cwd=tmp_path,
         env={**os.environ, "SOL_EXECBENCH_CLOCKS_LOCKED": "0"},
         capture_output=True,
