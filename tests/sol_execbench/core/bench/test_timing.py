@@ -432,6 +432,31 @@ class TestCuptiTimingAttribution:
                 cold_l2_cache=False,
             )
 
+    def test_cupti_timing_rejects_back_to_back_kernel_bypass(self, monkeypatch):
+        """Launching two kernels in iter 0 and none in iter 1 must be rejected."""
+        self._mock_cupti(
+            monkeypatch,
+            [self._kernel("user_k", 1, 10, 20)],
+            [
+                # Two back-to-back launches inside iter 0 ([100_000, 120_000])
+                self._kernel("user_k", 2, 105_000, 110_000),
+                self._kernel("user_k", 3, 111_000, 116_000),
+                # Nothing launched in iter 1 ([250_000, 270_000]), normal iter 2
+                self._kernel("user_k", 4, 405_000, 410_000),
+            ],
+            [100_000, 120_000, 250_000, 270_000, 400_000, 420_000],
+        )
+
+        with pytest.raises(
+            ValueError, match="Expected kernel activity sequence not found"
+        ):
+            bench_gpu_time_with_cupti(
+                lambda: None,
+                warmup=0,
+                rep=3,
+                cold_l2_cache=False,
+            )
+
 
 # ---------------------------------------------------------------------------
 # bench_time_with_cuda_events — requires CUDA; tested via mock or skipped

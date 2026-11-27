@@ -40,6 +40,7 @@ GPU_TIMING_ACTIVITY_KINDS = (
     cupti.ActivityKind.MEMSET,
 )
 DEFAULT_CUPTI_CLOCK_SKEW_TOLERANCE_NS = 5_000_000
+DEFAULT_CUPTI_CLOCK_DRIFT_TOLERANCE_NS = 50_000
 
 
 def get_l2_cache_size(device) -> int:
@@ -110,12 +111,47 @@ def clone_args(args: list[Any]) -> list[Any]:
     return [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
 
 
+def _has_consistent_clock_offset(
+    aligned: list[list[CuptiKernelInfo]],
+    iter_timestamps: list[tuple[float, float]],
+    *,
+    max_offset_ns: float,
+    max_drift_ns: float,
+) -> bool:
+    """Verify all aligned iterations share a bounded GPU-to-CPU clock offset.
+
+    For iteration ``i``, every kernel start falls inside
+    ``[start_cpu_i + delta_i, end_cpu_i + delta_i]`` iff
+    ``lower_i <= delta_i <= upper_i`` where
+    ``lower_i = max(k.start - end_cpu_i)`` and
+    ``upper_i = min(k.start - start_cpu_i)``.
+    Requiring one global offset within ``max_offset_ns`` and per-run drift
+    within ``max_drift_ns`` accommodates real CPU/GPU clock skew while
+    rejecting back-to-back launches in one iteration that skip the next.
+    """
+    lowers = [
+        max(k.start - end_cpu for k in iter_kernels)
+        for iter_kernels, (_, end_cpu) in zip(aligned, iter_timestamps)
+    ]
+    uppers = [
+        min(k.start - start_cpu for k in iter_kernels)
+        for iter_kernels, (start_cpu, _) in zip(aligned, iter_timestamps)
+    ]
+    min_shared_offset = max(lowers)
+    max_shared_offset = min(uppers)
+    if min_shared_offset - max_shared_offset > 2 * max_drift_ns:
+        return False
+    midpoint_offset = 0.5 * (min_shared_offset + max_shared_offset)
+    return abs(midpoint_offset) <= max_offset_ns
+
+
 def _attribute_cupti_iterations(
     sorted_kernels: list[CuptiKernelInfo],
     iter_timestamps: list[tuple[float, float]],
     expected_kernel_names: list[str],
     *,
     clock_skew_tolerance_ns: float = DEFAULT_CUPTI_CLOCK_SKEW_TOLERANCE_NS,
+    clock_drift_tolerance_ns: float = DEFAULT_CUPTI_CLOCK_DRIFT_TOLERANCE_NS,
 ) -> list[list[CuptiKernelInfo]]:
     """Attribute CUPTI GPU activities to each synchronized timed iteration.
 
@@ -129,8 +165,9 @@ def _attribute_cupti_iterations(
     Pass 1 attempts exact ``[start_cpu, end_cpu]`` window matching with
     monotonic consumption. If any iteration fails due to clock-domain skew,
     Pass 2 reconciles the synchronized sequence within
-    ``clock_skew_tolerance_ns`` while ensuring every iteration claims a
-    disjoint, monotonically advancing activity sequence.
+    ``clock_skew_tolerance_ns`` and verifies consistent clock-offset drift
+    while ensuring every iteration claims a disjoint, monotonically advancing
+    activity sequence.
     """
     kernel_starts = [kernel.start for kernel in sorted_kernels]
     kernel_to_index = {id(kernel): i for i, kernel in enumerate(sorted_kernels)}
@@ -185,7 +222,12 @@ def _attribute_cupti_iterations(
                 valid_alignment = False
                 break
             aligned.append(iter_kernels)
-        if valid_alignment:
+        if valid_alignment and _has_consistent_clock_offset(
+            aligned,
+            iter_timestamps,
+            max_offset_ns=clock_skew_tolerance_ns,
+            max_drift_ns=clock_drift_tolerance_ns,
+        ):
             return aligned
 
     try:
@@ -208,10 +250,18 @@ def _attribute_cupti_iterations(
             )
             matched.append(iter_kernels)
             min_idx = max(kernel_to_index[id(k)] for k in iter_kernels) + 1
-        return matched
+        if _has_consistent_clock_offset(
+            matched,
+            iter_timestamps,
+            max_offset_ns=clock_skew_tolerance_ns,
+            max_drift_ns=clock_drift_tolerance_ns,
+        ):
+            return matched
     except ValueError:
-        assert saved_strict_error is not None
-        raise saved_strict_error from None
+        pass
+
+    assert saved_strict_error is not None
+    raise saved_strict_error from None
 
 
 def bench_gpu_time_with_cupti(
