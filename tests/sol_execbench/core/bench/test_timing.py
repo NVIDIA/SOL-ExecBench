@@ -313,6 +313,150 @@ class TestCuptiTimingAttribution:
             cold_l2_cache=False,
         ) == pytest.approx([0.000045])
 
+    def test_cupti_timing_handles_cpu_gpu_clock_skew_edges(self, monkeypatch):
+        """Iteration 0 before start_cpu and final iteration after end_cpu."""
+        self._mock_cupti(
+            monkeypatch,
+            [self._kernel("user_k", 1, 10, 20)],
+            [
+                # Skewed 15 us before start_cpu[0] (100_000)
+                self._kernel("user_k", 2, 85_000, 95_000),
+                # Inside [200_000, 220_000]
+                self._kernel("user_k", 3, 205_000, 217_000),
+                # Skewed 12 us after end_cpu[2] (320_000)
+                self._kernel("user_k", 4, 332_000, 347_000),
+            ],
+            [100_000, 120_000, 200_000, 220_000, 300_000, 320_000],
+        )
+
+        assert bench_gpu_time_with_cupti(
+            lambda: None,
+            warmup=0,
+            rep=3,
+            cold_l2_cache=False,
+        ) == pytest.approx([0.01, 0.012, 0.015])
+
+    @pytest.mark.parametrize("clock_offset_ns", [80_000, -80_000])
+    def test_cupti_timing_handles_systematic_clock_offset(
+        self, monkeypatch, clock_offset_ns
+    ):
+        """Systematic GPU/CPU clock offset larger than one iteration period."""
+        self._mock_cupti(
+            monkeypatch,
+            [self._kernel("user_k", 1, 10, 20)],
+            [
+                self._kernel(
+                    "user_k", 2, 120_000 + clock_offset_ns, 130_000 + clock_offset_ns
+                ),
+                self._kernel(
+                    "user_k", 3, 200_000 + clock_offset_ns, 215_000 + clock_offset_ns
+                ),
+                self._kernel(
+                    "user_k", 4, 280_000 + clock_offset_ns, 300_000 + clock_offset_ns
+                ),
+            ],
+            [100_000, 170_000, 180_000, 250_000, 260_000, 330_000],
+        )
+
+        assert bench_gpu_time_with_cupti(
+            lambda: None,
+            warmup=0,
+            rep=3,
+            cold_l2_cache=False,
+        ) == pytest.approx([0.01, 0.015, 0.02])
+
+    def test_cupti_timing_handles_skew_with_same_named_setup_kernel(self, monkeypatch):
+        """Noisy setup sharing a kernel name picks the closest skewed match."""
+        self._mock_cupti(
+            monkeypatch,
+            [self._kernel("user_k", 1, 10, 20)],
+            [
+                # Setup kernel 50 us before start_cpu[0]
+                self._kernel("user_k", 2, 50_000, 55_000),
+                # True iter 0 kernel skewed 5 us after end_cpu[0]
+                self._kernel("user_k", 3, 125_000, 137_000),
+                # Setup kernel before iter 1
+                self._kernel("user_k", 4, 200_000, 204_000),
+                # True iter 1 kernel inside [300_000, 320_000]
+                self._kernel("user_k", 5, 305_000, 320_000),
+            ],
+            [100_000, 120_000, 300_000, 320_000],
+        )
+
+        assert bench_gpu_time_with_cupti(
+            lambda: None,
+            warmup=0,
+            rep=2,
+            cold_l2_cache=False,
+        ) == pytest.approx([0.012, 0.015])
+
+    def test_cupti_timing_still_rejects_missing_iteration_kernel(self, monkeypatch):
+        """Skipping a kernel launch on one iteration must still raise ValueError."""
+        self._mock_cupti(
+            monkeypatch,
+            [self._kernel("user_k", 1, 10, 20)],
+            [
+                self._kernel("user_k", 2, 105_000, 115_000),
+            ],
+            [100_000, 120_000, 200_000, 220_000],
+        )
+
+        with pytest.raises(
+            ValueError, match="Expected kernel activity sequence not found"
+        ):
+            bench_gpu_time_with_cupti(
+                lambda: None,
+                warmup=0,
+                rep=2,
+                cold_l2_cache=False,
+            )
+
+    def test_cupti_timing_still_rejects_excessive_clock_skew(self, monkeypatch):
+        """Activities beyond the clock-skew tolerance are still rejected."""
+        self._mock_cupti(
+            monkeypatch,
+            [self._kernel("user_k", 1, 10, 20)],
+            [
+                self._kernel("user_k", 2, 10_000_000, 10_010_000),
+            ],
+            [100_000, 120_000],
+        )
+
+        with pytest.raises(
+            ValueError, match="Expected kernel activity sequence not found"
+        ):
+            bench_gpu_time_with_cupti(
+                lambda: None,
+                warmup=0,
+                rep=1,
+                cold_l2_cache=False,
+            )
+
+    def test_cupti_timing_rejects_back_to_back_kernel_bypass(self, monkeypatch):
+        """Launching two kernels in iter 0 and none in iter 1 must be rejected."""
+        self._mock_cupti(
+            monkeypatch,
+            [self._kernel("user_k", 1, 10, 20)],
+            [
+                # Two back-to-back launches inside iter 0 ([100_000, 120_000])
+                self._kernel("user_k", 2, 105_000, 110_000),
+                self._kernel("user_k", 3, 111_000, 116_000),
+                # Nothing launched in iter 1 ([250_000, 270_000]), normal iter 2
+                self._kernel("user_k", 4, 405_000, 410_000),
+            ],
+            [100_000, 120_000, 250_000, 270_000, 400_000, 420_000],
+        )
+
+        with pytest.raises(
+            ValueError, match="Expected kernel activity sequence not found"
+        ):
+            bench_gpu_time_with_cupti(
+                lambda: None,
+                warmup=0,
+                rep=3,
+                cold_l2_cache=False,
+            )
+
 
 # ---------------------------------------------------------------------------
 # bench_time_with_cuda_events — requires CUDA; tested via mock or skipped

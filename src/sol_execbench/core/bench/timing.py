@@ -39,6 +39,8 @@ GPU_TIMING_ACTIVITY_KINDS = (
     cupti.ActivityKind.MEMCPY,
     cupti.ActivityKind.MEMSET,
 )
+DEFAULT_CUPTI_CLOCK_SKEW_TOLERANCE_NS = 5_000_000
+DEFAULT_CUPTI_CLOCK_DRIFT_TOLERANCE_NS = 50_000
 
 
 def get_l2_cache_size(device) -> int:
@@ -107,6 +109,159 @@ def clone_args(args: list[Any]) -> list[Any]:
     starts with independent data.  Non-tensor arguments are passed through.
     """
     return [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
+
+
+def _has_consistent_clock_offset(
+    aligned: list[list[CuptiKernelInfo]],
+    iter_timestamps: list[tuple[float, float]],
+    *,
+    max_offset_ns: float,
+    max_drift_ns: float,
+) -> bool:
+    """Verify all aligned iterations share a bounded GPU-to-CPU clock offset.
+
+    For iteration ``i``, every kernel start falls inside
+    ``[start_cpu_i + delta_i, end_cpu_i + delta_i]`` iff
+    ``lower_i <= delta_i <= upper_i`` where
+    ``lower_i = max(k.start - end_cpu_i)`` and
+    ``upper_i = min(k.start - start_cpu_i)``.
+    Requiring one global offset within ``max_offset_ns`` and per-run drift
+    within ``max_drift_ns`` accommodates real CPU/GPU clock skew while
+    rejecting back-to-back launches in one iteration that skip the next.
+    """
+    lowers = [
+        max(k.start - end_cpu for k in iter_kernels)
+        for iter_kernels, (_, end_cpu) in zip(aligned, iter_timestamps)
+    ]
+    uppers = [
+        min(k.start - start_cpu for k in iter_kernels)
+        for iter_kernels, (start_cpu, _) in zip(aligned, iter_timestamps)
+    ]
+    min_shared_offset = max(lowers)
+    max_shared_offset = min(uppers)
+    if min_shared_offset - max_shared_offset > 2 * max_drift_ns:
+        return False
+    midpoint_offset = 0.5 * (min_shared_offset + max_shared_offset)
+    return abs(midpoint_offset) <= max_offset_ns
+
+
+def _attribute_cupti_iterations(
+    sorted_kernels: list[CuptiKernelInfo],
+    iter_timestamps: list[tuple[float, float]],
+    expected_kernel_names: list[str],
+    *,
+    clock_skew_tolerance_ns: float = DEFAULT_CUPTI_CLOCK_SKEW_TOLERANCE_NS,
+    clock_drift_tolerance_ns: float = DEFAULT_CUPTI_CLOCK_DRIFT_TOLERANCE_NS,
+) -> list[list[CuptiKernelInfo]]:
+    """Attribute CUPTI GPU activities to each synchronized timed iteration.
+
+    Each timed iteration ends with ``torch.cuda.synchronize()``, so GPU
+    activities from iteration ``i`` are strictly ordered after iteration
+    ``i - 1``. Because ``cupti.get_timestamp()`` is sampled in the CPU clock
+    domain while ``CONCURRENT_KERNEL`` timestamps use CUPTI's GPU-to-CPU clock
+    correlation, small clock-offset skew on virtualized hosts can place an
+    iteration's kernel start slightly outside ``[start_cpu, end_cpu]``.
+
+    Pass 1 attempts exact ``[start_cpu, end_cpu]`` window matching with
+    monotonic consumption. If any iteration fails due to clock-domain skew,
+    Pass 2 reconciles the synchronized sequence within
+    ``clock_skew_tolerance_ns`` and verifies consistent clock-offset drift
+    while ensuring every iteration claims a disjoint, monotonically advancing
+    activity sequence.
+    """
+    kernel_starts = [kernel.start for kernel in sorted_kernels]
+    kernel_to_index = {id(kernel): i for i, kernel in enumerate(sorted_kernels)}
+
+    saved_strict_error: ValueError | None = None
+    try:
+        matched: list[list[CuptiKernelInfo]] = []
+        min_idx = 0
+        for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
+            left_idx = max(min_idx, bisect.bisect_left(kernel_starts, start_cpu))
+            right_idx = max(left_idx, bisect.bisect_right(kernel_starts, end_cpu))
+            iter_kernels = select_activity_sequence(
+                sorted_kernels[left_idx:right_idx],
+                expected_kernel_names,
+                iteration=idx,
+            )
+            matched.append(iter_kernels)
+            min_idx = max(kernel_to_index[id(k)] for k in iter_kernels) + 1
+        return matched
+    except ValueError as strict_error:
+        if clock_skew_tolerance_ns <= 0:
+            raise
+        saved_strict_error = strict_error
+
+    expected_name_set = set(expected_kernel_names)
+    expected_count = len(expected_kernel_names)
+    candidate_kernels = [
+        kernel
+        for kernel in sorted_kernels
+        if kernel.kernel_string() in expected_name_set
+    ]
+    if len(candidate_kernels) == len(iter_timestamps) * expected_count:
+        aligned: list[list[CuptiKernelInfo]] = []
+        valid_alignment = True
+        for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
+            chunk = candidate_kernels[
+                idx * expected_count : (idx + 1) * expected_count
+            ]
+            try:
+                iter_kernels = select_activity_sequence(
+                    chunk,
+                    expected_kernel_names,
+                    iteration=idx,
+                )
+            except ValueError:
+                valid_alignment = False
+                break
+            skew_ns = max(
+                max(0.0, start_cpu - k.start, k.start - end_cpu) for k in iter_kernels
+            )
+            if skew_ns > clock_skew_tolerance_ns:
+                valid_alignment = False
+                break
+            aligned.append(iter_kernels)
+        if valid_alignment and _has_consistent_clock_offset(
+            aligned,
+            iter_timestamps,
+            max_offset_ns=clock_skew_tolerance_ns,
+            max_drift_ns=clock_drift_tolerance_ns,
+        ):
+            return aligned
+
+    try:
+        matched = []
+        min_idx = 0
+        for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
+            left_idx = max(
+                min_idx,
+                bisect.bisect_left(kernel_starts, start_cpu - clock_skew_tolerance_ns),
+            )
+            right_idx = max(
+                left_idx,
+                bisect.bisect_right(kernel_starts, end_cpu + clock_skew_tolerance_ns),
+            )
+            iter_kernels = select_activity_sequence(
+                sorted_kernels[left_idx:right_idx],
+                expected_kernel_names,
+                iteration=idx,
+                target_window=(start_cpu, end_cpu),
+            )
+            matched.append(iter_kernels)
+            min_idx = max(kernel_to_index[id(k)] for k in iter_kernels) + 1
+        if _has_consistent_clock_offset(
+            matched,
+            iter_timestamps,
+            max_offset_ns=clock_skew_tolerance_ns,
+            max_drift_ns=clock_drift_tolerance_ns,
+        ):
+            return matched
+    except ValueError:
+        pass
+
+    assert saved_strict_error is not None
+    raise saved_strict_error from None
 
 
 def bench_gpu_time_with_cupti(
@@ -190,17 +345,13 @@ def bench_gpu_time_with_cupti(
         cupti_buffers.kernels,
         key=lambda kernel: (kernel.start, kernel.end, kernel.correlation_id),
     )
-    kernel_starts = [kernel.start for kernel in sorted_kernels]
+    iter_kernel_sequences = _attribute_cupti_iterations(
+        sorted_kernels,
+        iter_timestamps,
+        expected_kernel_names,
+    )
     measured_times = []
-    for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
-        left_idx = bisect.bisect_left(kernel_starts, start_cpu)
-        right_idx = bisect.bisect_right(kernel_starts, end_cpu)
-        window_kernels: list[CuptiKernelInfo] = sorted_kernels[left_idx:right_idx]
-        iter_kernels = select_activity_sequence(
-            window_kernels,
-            expected_kernel_names,
-            iteration=idx,
-        )
+    for iter_kernels in iter_kernel_sequences:
         assert kernel_activity_counts(iter_kernels) == expected_kernel_counts
         min_start = min(k.start for k in iter_kernels)
         max_end = max(k.end for k in iter_kernels)

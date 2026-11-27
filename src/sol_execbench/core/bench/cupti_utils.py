@@ -16,6 +16,7 @@ from cupti import cupti
 
 DEFAULT_CUPTI_BUFFER_SIZE_BYTES = 8 * 1024 * 1024
 DEFAULT_CUPTI_MAX_BUFFER_RECORDS = 0
+CUPTI_ACTIVITY_FLAG_FLUSH_FORCED = 1
 DEFAULT_CUPTI_ACTIVITY_KINDS = (
     cupti.ActivityKind.RUNTIME,
     cupti.ActivityKind.CONCURRENT_KERNEL,
@@ -134,11 +135,23 @@ def _kernel_activity_span(kernels: list[CuptiKernelInfo]) -> float:
     )
 
 
+def _window_distance(
+    kernels: list[CuptiKernelInfo],
+    target_window: tuple[float, float],
+) -> float:
+    """Return the maximum distance any kernel start falls outside target_window."""
+    start_cpu, end_cpu = target_window
+    return max(
+        max(0.0, start_cpu - kernel.start, kernel.start - end_cpu) for kernel in kernels
+    )
+
+
 def select_activity_sequence(
     kernels: list[CuptiKernelInfo],
     expected_kernel_names: list[str],
     *,
     iteration: int,
+    target_window: tuple[float, float] | None = None,
 ) -> list[CuptiKernelInfo]:
     """Select the discovered user activity sequence from a noisy timing window."""
     expected_count = len(expected_kernel_names)
@@ -152,23 +165,32 @@ def select_activity_sequence(
     ]
     candidate_names = kernel_activity_sequence(candidate_kernels)
 
-    for start_idx in range(len(candidate_kernels) - expected_count + 1):
-        end_idx = start_idx + expected_count
-        if candidate_names[start_idx:end_idx] == expected_kernel_names:
-            return candidate_kernels[start_idx:end_idx]
+    if target_window is None:
+        for start_idx in range(len(candidate_kernels) - expected_count + 1):
+            end_idx = start_idx + expected_count
+            if candidate_names[start_idx:end_idx] == expected_kernel_names:
+                return candidate_kernels[start_idx:end_idx]
 
     best_kernels: list[CuptiKernelInfo] | None = None
-    best_score: tuple[int, float] | None = None
+    best_score: tuple[float, ...] | None = None
     for start_idx in range(len(candidate_kernels) - expected_count + 1):
         end_idx = start_idx + expected_count
         window_names = candidate_names[start_idx:end_idx]
         if Counter(window_names) != expected_counts:
             continue
         window_kernels = candidate_kernels[start_idx:end_idx]
-        score = (
-            _relative_order_score(window_names, expected_kernel_names),
-            -_kernel_activity_span(window_kernels),
-        )
+        if target_window is not None:
+            score: tuple[float, ...] = (
+                -_window_distance(window_kernels, target_window),
+                1 if window_names == expected_kernel_names else 0,
+                _relative_order_score(window_names, expected_kernel_names),
+                -_kernel_activity_span(window_kernels),
+            )
+        else:
+            score = (
+                _relative_order_score(window_names, expected_kernel_names),
+                -_kernel_activity_span(window_kernels),
+            )
         if best_score is None or score > best_score:
             best_score = score
             best_kernels = window_kernels
@@ -213,18 +235,19 @@ def collect_cupti_activities(
     buffers = CuptiActivityBuffers()
     enabled_activity_kinds: list[Any] = []
     try:
+        if activity_kinds:
+            cupti.activity_register_callbacks(
+                request_cupti_activity_buffer,
+                partial(collect_cupti_activity_records, buffers),
+            )
         for activity_kind in activity_kinds:
             cupti.activity_enable(activity_kind)
             enabled_activity_kinds.append(activity_kind)
-        cupti.activity_register_callbacks(
-            request_cupti_activity_buffer,
-            partial(collect_cupti_activity_records, buffers),
-        )
         yield buffers
     finally:
         if enabled_activity_kinds:
             try:
-                cupti.activity_flush_all(0)
+                cupti.activity_flush_all(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED)
             finally:
                 for activity_kind in enabled_activity_kinds:
                     cupti.activity_disable(activity_kind)
